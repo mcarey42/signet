@@ -15,6 +15,17 @@
 - Agents share the kernel's client libraries from the same repo; native shims
   live in `agents/shims/<platform>/` with their own build chains.
 
+## MVP layout (validated by E-14/E-15 — see doc 15)
+
+The first slice ships **6 internal packages + cmd**, not the fuller sketch
+below: `op` (leaf: versioned Op codec), `store` (bbolt + barrier + file-seal +
+audit bucket), `kernel` (domain logic + `Proposer` port + `Apply`), `fsm`
+(raft.FSM → kernel.Apply, implements Proposer — cannot merge into store: cycle),
+`attest`, `dialect/vaultkv`. The full sketch below is the *destination*; split
+`kernel` along its lines and add `keys`/`dialects/*`/`backup`/`consensus`
+only when a milestone needs them. Naming reconciliation: singular `dialect/`;
+`fsm` (not `consensus`) for the Raft state-machine glue.
+
 ## Sketch (to be validated by first vertical slice)
 
 ```
