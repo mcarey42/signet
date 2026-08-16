@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mcarey/signet/internal/attest"
 	"github.com/mcarey/signet/internal/op"
 	"github.com/mcarey/signet/internal/store"
 )
@@ -33,13 +34,14 @@ type Proposer interface {
 // method rather than as a separate call a dialect could forget to make
 // (charter principle 5).
 type Kernel struct {
-	store *store.Store
-	prop  Proposer
-	now   func() time.Time
+	store     *store.Store
+	prop      Proposer
+	verifiers *attest.Registry
+	now       func() time.Time
 }
 
 func New(s *store.Store, p Proposer) *Kernel {
-	return &Kernel{store: s, prop: p, now: time.Now}
+	return &Kernel{store: s, prop: p, verifiers: attest.Default(), now: time.Now}
 }
 
 // SetClock is for tests only.
@@ -47,6 +49,80 @@ func (k *Kernel) SetClock(f func() time.Time) { k.now = f }
 
 func (k *Kernel) header(actor op.ID) op.Header {
 	return op.Header{Actor: actor, AtSec: k.now().Unix()}
+}
+
+// --- Authentication -------------------------------------------------------
+
+// Evidence is what a caller presents to prove who it is. The dialect passes the
+// material through untouched: it never parses, inspects, or verifies it, so a
+// dialect bug cannot become an authentication bypass.
+type Evidence struct {
+	// Rule names the mapping rule to evaluate — Vault calls this a "role", and
+	// clients send it as one. It selects policy, never trust: the rule decides
+	// which registered issuer verifies the material.
+	Rule     string
+	Material []byte
+}
+
+// Login verifies evidence and, if a mapping rule accepts it, mints a session.
+//
+// The order matters. Verification happens first and against a *pinned* issuer
+// chosen by configuration, so evidence minted for another audience or signed by
+// another key is rejected before any policy is consulted. Only then does a rule
+// decide which principal the proven identity becomes.
+func (k *Kernel) Login(ctx context.Context, ev Evidence) (string, Session, error) {
+	var (
+		mapping Mapping
+		issuer  Issuer
+	)
+	if err := k.store.View(func(tx *store.Tx) error {
+		raw, ok, err := tx.Get(store.BucketMappings, ev.Rule)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no mapping rule named %q", ev.Rule)
+		}
+		if err := json.Unmarshal(raw, &mapping); err != nil {
+			return err
+		}
+		raw, ok, err = tx.Get(store.BucketIssuers, mapping.Issuer)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("mapping %q names unregistered issuer %q", ev.Rule, mapping.Issuer)
+		}
+		return json.Unmarshal(raw, &issuer)
+	}); err != nil {
+		return "", Session{}, err
+	}
+
+	verifier, err := k.verifiers.Get(issuer.Verifier)
+	if err != nil {
+		return "", Session{}, err
+	}
+	id, err := verifier.Verify(ev.Material, attest.Issuer{
+		Name: issuer.Name, URL: issuer.URL, Audience: issuer.Audience, JWKS: issuer.JWKS,
+	}, k.now())
+	if err != nil {
+		return "", Session{}, err
+	}
+	if !mapping.Matches(id.Namespace, id.Account) {
+		return "", Session{}, fmt.Errorf("mapping %q does not accept %s/%s", ev.Rule, id.Namespace, id.Account)
+	}
+
+	ttl := time.Duration(mapping.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	// The session never outlives the evidence that produced it.
+	if !id.Expiry.IsZero() {
+		if max := time.Until(id.Expiry); max > 0 && max < ttl {
+			ttl = max
+		}
+	}
+	return k.CreateSession(ctx, mapping.Principal, mapping.Principal, ttl, []string{id.Verifier}, id.Verifier)
 }
 
 // --- Sessions -------------------------------------------------------------
@@ -186,6 +262,39 @@ func (k *Kernel) PutBinding(ctx context.Context, grantor, subject op.ID, role, s
 	res, err := k.prop.Propose(ctx, &op.PutBinding{
 		Header: k.header(grantor), ID: id, Subject: subject,
 		Role: role, Scope: scope, Grantor: grantor, NotAfter: notAfter,
+	})
+	if err != nil {
+		return "", err
+	}
+	return res.ID, nil
+}
+
+// PutIssuer registers a pinned attestation trust anchor.
+func (k *Kernel) PutIssuer(ctx context.Context, grantor op.ID, name, verifier, url, audience string, jwks []byte) (op.ID, error) {
+	id, err := newID()
+	if err != nil {
+		return "", err
+	}
+	res, err := k.prop.Propose(ctx, &op.PutIssuer{
+		Header: k.header(grantor), ID: id, Name: name, Verifier: verifier,
+		URL: url, Audience: audience, JWKS: jwks, Grantor: grantor,
+	})
+	if err != nil {
+		return "", err
+	}
+	return res.ID, nil
+}
+
+// PutMapping records which verified identities become which principal.
+func (k *Kernel) PutMapping(ctx context.Context, grantor op.ID, m Mapping) (op.ID, error) {
+	id, err := newID()
+	if err != nil {
+		return "", err
+	}
+	res, err := k.prop.Propose(ctx, &op.PutMapping{
+		Header: k.header(grantor), ID: id, Name: m.Name, Issuer: m.Issuer,
+		Namespaces: m.Namespaces, ServiceAccounts: m.ServiceAccounts,
+		Principal: m.Principal, TTLSeconds: m.TTLSeconds, Grantor: grantor,
 	})
 	if err != nil {
 		return "", err

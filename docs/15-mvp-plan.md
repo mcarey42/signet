@@ -240,8 +240,36 @@ final one, not a fork.
    log otherwise yields revoked tokens); and a `SecretStore` **caches its
    readiness**, so one left over from a previous domain stays NotReady against
    tokens that no longer exist — the consumer namespace is recreated each run.
-3. **k8s-SA login last**: the JWKS/JWT verifier drops in as the final package;
-   the goal line ("via k8s-SA attestation") is crossed when it does.
+3. ✅ **k8s-SA login — DONE (2026-08-16). THE MVP GOAL LINE IS CROSSED.**
+   ESO now authenticates as its **own Kubernetes workload identity**: no token,
+   no shared secret anywhere in the manifests. It asks Kubernetes for a
+   short-lived ServiceAccount token with audience `signet`, posts it to
+   `/v1/auth/kubernetes/login`, and receives a session — the same flow it uses
+   against Vault, which is why it works unmodified.
+
+   `internal/attest` implements JWS verification on the **standard library
+   only** (RS256/ES256, JWKS parsing) — no JWT dependency on the auth path.
+   Verified failure modes, each a real attack: `alg=none`, alg confusion (RSA
+   public key as an HMAC secret), wrong/absent audience, wrong issuer, expired,
+   no expiry, tampered payload, unpinned signing key, `sub` disagreeing with
+   the `kubernetes.io` claim, and a non-ServiceAccount subject.
+
+   Three properties worth recording:
+   - **Attestation and authorization are separate steps.** A second, real
+     ServiceAccount in the same namespace (`impostor`) is correctly attested
+     and still refused, because the mapping rule names accounts exactly.
+   - **A session never outlives its evidence.** The mapping asked for a 900s
+     TTL; the issued lease came back as 600s, clamped to the SA token's own
+     expiry.
+   - **Mapping rules are authorization-bearing writes.** A subtree admin cannot
+     map an identity onto a principal outside their subtree, and cannot
+     register a trust anchor at all (domain-wide authority) — the ESC1 shape
+     reached through authentication config rather than through a grant.
+     Property-tested.
+
+   Keys are **pinned out of band** (fetched from the cluster's OIDC discovery
+   endpoint into a mounted file), never discovered from a request — E-01 AT-1/
+   AT-2. `test/kind/run.sh` covers the whole thing end to end.
 
 ## Testing (MVP)
 

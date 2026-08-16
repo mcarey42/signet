@@ -78,6 +78,24 @@ type GenesisConfig struct {
 		Role    string `json:"role"`
 		Scope   string `json:"scope"`
 	} `json:"bindings"`
+	// Issuers are pinned attestation trust anchors. The key set is referenced
+	// by file rather than inlined so it can be mounted separately and rotated
+	// without rewriting policy.
+	Issuers []struct {
+		Name     string `json:"name"`
+		Verifier string `json:"verifier"`
+		URL      string `json:"url"`
+		Audience string `json:"audience"`
+		JWKSFile string `json:"jwks_file"`
+	} `json:"issuers"`
+	Mappings []struct {
+		Name            string   `json:"name"`
+		Issuer          string   `json:"issuer"`
+		Namespaces      []string `json:"namespaces"`
+		ServiceAccounts []string `json:"service_accounts"`
+		Principal       string   `json:"principal"` // principal path
+		TTLSeconds      int64    `json:"ttl_seconds"`
+	} `json:"mappings"`
 }
 
 func cmdGenesis(args []string) error {
@@ -192,6 +210,29 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 			return fmt.Errorf("config: binding %s@%s: %w", b.Role, b.Scope, err)
 		}
 		fmt.Fprintf(os.Stderr, "  binding %s -> %s at %s\n", b.Subject, b.Role, b.Scope)
+	}
+	for _, i := range cfg.Issuers {
+		jwks, err := os.ReadFile(i.JWKSFile)
+		if err != nil {
+			return fmt.Errorf("config: issuer %s: %w", i.Name, err)
+		}
+		if _, err := k.PutIssuer(ctx, actor, i.Name, i.Verifier, i.URL, i.Audience, jwks); err != nil {
+			return fmt.Errorf("config: issuer %s: %w", i.Name, err)
+		}
+		fmt.Fprintf(os.Stderr, "  issuer %s (%s, audience %q)\n", i.Name, i.URL, i.Audience)
+	}
+	for _, m := range cfg.Mappings {
+		p, err := k.PrincipalByPath(ctx, m.Principal)
+		if err != nil {
+			return fmt.Errorf("config: mapping %s: principal %s: %w", m.Name, m.Principal, err)
+		}
+		if _, err := k.PutMapping(ctx, actor, kernel.Mapping{
+			Name: m.Name, Issuer: m.Issuer, Namespaces: m.Namespaces,
+			ServiceAccounts: m.ServiceAccounts, Principal: p.ID, TTLSeconds: m.TTLSeconds,
+		}); err != nil {
+			return fmt.Errorf("config: mapping %s: %w", m.Name, err)
+		}
+		fmt.Fprintf(os.Stderr, "  mapping %s: %v/%v -> %s\n", m.Name, m.Namespaces, m.ServiceAccounts, m.Principal)
 	}
 	return nil
 }

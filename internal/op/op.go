@@ -33,6 +33,8 @@ const (
 	KindPutSecret     Kind = 3
 	KindCreateSession Kind = 4
 	KindRevokeSession Kind = 5
+	KindPutIssuer     Kind = 6
+	KindPutMapping    Kind = 7
 )
 
 func (k Kind) String() string {
@@ -47,6 +49,10 @@ func (k Kind) String() string {
 		return "CreateSession"
 	case KindRevokeSession:
 		return "RevokeSession"
+	case KindPutIssuer:
+		return "PutIssuer"
+	case KindPutMapping:
+		return "PutMapping"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -113,11 +119,46 @@ type RevokeSession struct {
 	TokenHash string `json:"token_hash"`
 }
 
+// PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
+// tokens must carry, the Signet-specific audience they must be minted for, and
+// the key set that verifies them. Keys are registered out of band and never
+// discovered from a URL a request supplies.
+type PutIssuer struct {
+	Header
+	ID       ID     `json:"id"`
+	Name     string `json:"name"`
+	Verifier string `json:"verifier"`
+	URL      string `json:"url"`
+	Audience string `json:"audience"`
+	JWKS     []byte `json:"jwks"`
+	Grantor  ID     `json:"grantor"`
+}
+
+// PutMapping records which verified identities become which principal. It is
+// an authorization-bearing write — whoever can author mappings can decide who
+// gets to be whom — so it obeys delegation-only-narrows exactly like a binding
+// (E-01 K-1, the ESC1 lesson).
+type PutMapping struct {
+	Header
+	ID     ID     `json:"id"`
+	Name   string `json:"name"` // the "role" a client names at login
+	Issuer string `json:"issuer"`
+	// Matchers are exact-match lists, never patterns. A matcher language on the
+	// authentication path is a policy engine through the back door (docs/13).
+	Namespaces      []string `json:"namespaces"`
+	ServiceAccounts []string `json:"service_accounts"`
+	Principal       ID       `json:"principal"`
+	TTLSeconds      int64    `json:"ttl_seconds"`
+	Grantor         ID       `json:"grantor"`
+}
+
 func (PutPrincipal) OpKind() Kind  { return KindPutPrincipal }
 func (PutBinding) OpKind() Kind    { return KindPutBinding }
 func (PutSecret) OpKind() Kind     { return KindPutSecret }
 func (CreateSession) OpKind() Kind { return KindCreateSession }
 func (RevokeSession) OpKind() Kind { return KindRevokeSession }
+func (PutIssuer) OpKind() Kind     { return KindPutIssuer }
+func (PutMapping) OpKind() Kind    { return KindPutMapping }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -173,6 +214,12 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindRevokeSession:
 		var v RevokeSession
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutIssuer:
+		var v PutIssuer
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutMapping:
+		var v PutMapping
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

@@ -39,6 +39,15 @@ say "create the cluster"
 kind get clusters 2>/dev/null | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 
+say "pin the cluster's signing keys (out of band)"
+# Signet never discovers verification keys from a request. They are fetched
+# here, from the cluster's OIDC discovery endpoint, and mounted as a file.
+k apply -f "$HERE/signet.yaml" >/dev/null 2>&1 || true
+k get --raw /openid/v1/jwks > "$BUILD/jwks.json"
+k -n signet delete configmap signet-jwks --ignore-not-found >/dev/null
+k -n signet create configmap signet-jwks --from-file=jwks.json="$BUILD/jwks.json" >/dev/null
+echo "issuer: $(k get --raw /.well-known/openid-configuration | python3 -c 'import sys,json;print(json.load(sys.stdin)["issuer"])')"
+
 say "deploy signet"
 k apply -f "$HERE/signet.yaml"
 # Always start from a fresh domain. The data directory is an emptyDir, so
@@ -51,13 +60,14 @@ k -n signet rollout status deploy/signet --timeout=180s
 # longer exist — recreating it is what makes the run reproducible.
 k delete ns demo --ignore-not-found --wait >/dev/null 2>&1 || true
 
-say "collect bootstrap tokens from the genesis log"
+say "collect the root token from the genesis log"
+# Only the operator token is bootstrapped. ESO gets no token at all — it
+# authenticates as its Kubernetes workload identity.
 POD=$(k -n signet get pod -l app=signet -o jsonpath='{.items[0].metadata.name}')
 LOG=$(k -n signet logs "$POD" -c genesis)
 ROOT_TOKEN=$(awk '/root token:/{print $3}' <<<"$LOG")
-ESO_TOKEN=$(awk '/token \/clusters\/svc\/apps\/eso:/{print $3}' <<<"$LOG")
-[[ -n $ROOT_TOKEN && -n $ESO_TOKEN ]] || { echo "could not parse tokens"; exit 1; }
-echo "root=${ROOT_TOKEN:0:16}...  eso=${ESO_TOKEN:0:16}..."
+[[ -n $ROOT_TOKEN ]] || { echo "could not parse the root token"; exit 1; }
+echo "root=${ROOT_TOKEN:0:16}...  (no ESO token: it attests instead)"
 
 say "seed secrets through the API"
 k -n signet port-forward svc/signet 8300:8200 >/dev/null 2>&1 &
@@ -81,7 +91,7 @@ helm --kube-context "$CTX" upgrade --install external-secrets external-secrets/e
 echo "ESO $(helm --kube-context "$CTX" -n external-secrets list -f external-secrets -o json | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["app_version"])')"
 
 say "apply SecretStore + ExternalSecrets"
-sed "s|REPLACED_AT_APPLY_TIME|$ESO_TOKEN|" "$HERE/externalsecret.yaml" | k apply -f -
+k apply -f "$HERE/externalsecret.yaml"
 sleep 20
 
 say "results"
@@ -95,7 +105,7 @@ if [[ $got == "sk-litellm-REAL" ]]; then
 else
 	echo "FAIL  in-scope secret: got '${got:-<none>}'"; fail=1
 fi
-for name in forbidden missing; do
+for name in forbidden missing impostor; do
 	ready=$(k -n demo get externalsecret "$name" -o jsonpath='{.status.conditions[0].status}' 2>/dev/null)
 	if [[ $ready == "False" ]]; then
 		echo "PASS  $name correctly refused"

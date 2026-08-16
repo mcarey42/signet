@@ -39,6 +39,10 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyCreateSession(tx, v)
 	case *op.RevokeSession:
 		return applyRevokeSession(tx, v)
+	case *op.PutIssuer:
+		return applyPutIssuer(tx, v)
+	case *op.PutMapping:
+		return applyPutMapping(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -192,6 +196,115 @@ func applyRevokeSession(tx *store.Tx, o *op.RevokeSession) op.Result {
 	return op.Result{}
 }
 
+// Registering a trust anchor decides whose signatures Signet will believe, so
+// it is domain-wide authority — no subtree admin can do it (E-13 F7's rule for
+// trust-graph writes).
+func applyPutIssuer(tx *store.Tx, o *op.PutIssuer) op.Result {
+	if o.ID == "" || o.Name == "" || o.URL == "" {
+		return op.Result{Err: errors.New("issuer: missing ID, name, or URL")}
+	}
+	if o.Audience == "" {
+		return op.Result{Err: errors.New("issuer: a Signet-specific audience is required")}
+	}
+	if len(o.JWKS) == 0 {
+		return op.Result{Err: errors.New("issuer: no pinned key set")}
+	}
+	if err := requireDomainAuthority(tx, o.Grantor, o.AtSec); err != nil {
+		return op.Result{Err: fmt.Errorf("issuer: %w", err)}
+	}
+	iss := Issuer{ID: o.ID, Name: o.Name, Verifier: o.Verifier, URL: o.URL, Audience: o.Audience, JWKS: o.JWKS}
+	blob, err := json.Marshal(iss)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if err := tx.Put(store.BucketIssuers, o.Name, blob); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{ID: o.ID}
+}
+
+func applyPutMapping(tx *store.Tx, o *op.PutMapping) op.Result {
+	if o.ID == "" || o.Name == "" {
+		return op.Result{Err: errors.New("mapping: missing ID or name")}
+	}
+	if len(o.Namespaces) == 0 || len(o.ServiceAccounts) == 0 {
+		return op.Result{Err: errors.New("mapping: must name the namespaces and service accounts it accepts")}
+	}
+	if _, ok, err := tx.Get(store.BucketIssuers, o.Issuer); err != nil {
+		return op.Result{Err: err}
+	} else if !ok {
+		return op.Result{Err: fmt.Errorf("mapping: no registered issuer %q", o.Issuer)}
+	}
+
+	// A mapping rule decides who a caller gets to *be*, so it is subject to the
+	// same narrowing as a grant: an admin of a subtree may only produce
+	// principals inside it. Without this, a delegated admin could map their own
+	// workload onto a superior principal — the ESC1 shape.
+	target, ok, err := loadPrincipal(tx, o.Principal)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if !ok {
+		return op.Result{Err: fmt.Errorf("mapping: principal %s does not exist", o.Principal)}
+	}
+	if o.Grantor == "" {
+		return op.Result{Err: errors.New("mapping: missing grantor")}
+	}
+	allowed, err := HasAuthority(tx, o.Grantor, VerbAdmin, target.Path, o.AtSec)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if !allowed {
+		return op.Result{Err: fmt.Errorf("mapping: grantor %s lacks admin authority over %s", o.Grantor, target.Path)}
+	}
+
+	m := Mapping{
+		ID: o.ID, Name: o.Name, Issuer: o.Issuer,
+		Namespaces: o.Namespaces, ServiceAccounts: o.ServiceAccounts,
+		Principal: o.Principal, TTLSeconds: o.TTLSeconds, Grantor: o.Grantor,
+	}
+	blob, err := json.Marshal(m)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if err := tx.Put(store.BucketMappings, o.Name, blob); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{ID: o.ID}
+}
+
+// requireDomainAuthority accepts either the bootstrap moment or an admin at the
+// domain root.
+func requireDomainAuthority(tx *store.Tx, grantor op.ID, atSec int64) error {
+	if grantor == "" {
+		empty, err := bindingsEmpty(tx)
+		if err != nil {
+			return err
+		}
+		if !empty {
+			return errors.New("missing grantor")
+		}
+		return nil
+	}
+	ok, err := HasAuthority(tx, grantor, VerbAdmin, "/", atSec)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("grantor %s lacks domain-wide admin authority", grantor)
+	}
+	return nil
+}
+
+func loadPrincipal(tx *store.Tx, id op.ID) (Principal, bool, error) {
+	var p Principal
+	raw, ok, err := tx.Get(store.BucketPrincipals, string(id))
+	if err != nil || !ok {
+		return p, ok, err
+	}
+	return p, true, json.Unmarshal(raw, &p)
+}
+
 func bindingsEmpty(tx *store.Tx) (bool, error) {
 	empty := true
 	err := tx.ScanPrefix(store.BucketBindings, "", func(string, []byte) bool {
@@ -223,6 +336,10 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 		r.Error = res.Err.Error()
 	}
 	switch v := o.(type) {
+	case *op.PutIssuer:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
+	case *op.PutMapping:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutPrincipal:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
 	case *op.PutBinding:

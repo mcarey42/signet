@@ -55,13 +55,30 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/sys/health", h.health)
 	mux.HandleFunc("GET /v1/sys/internal/ui/mounts/{path...}", h.mountPreflight)
+	mux.HandleFunc("POST /v1/auth/{mount}/login", h.login)
+	mux.HandleFunc("PUT /v1/auth/{mount}/login", h.login)
 	mux.HandleFunc("GET /v1/auth/token/lookup-self", h.lookupSelf)
 	mux.HandleFunc("PUT /v1/auth/token/revoke-self", h.revokeSelf)
 	mux.HandleFunc("POST /v1/auth/token/revoke-self", h.revokeSelf)
-	mux.HandleFunc("GET /v1/{mount}/data/{path...}", h.readSecret)
-	mux.HandleFunc("PUT /v1/{mount}/data/{path...}", h.writeSecret)
-	mux.HandleFunc("POST /v1/{mount}/data/{path...}", h.writeSecret)
+
+	// The KV mount is registered by its literal name rather than as a wildcard.
+	// A wildcard mount is genuinely ambiguous against the auth routes — both
+	// would match /v1/auth/data/login — and since a server serves the mounts it
+	// was configured with, naming them is also more honest: an unknown mount is
+	// a routing miss, not a permission question.
+	data := "/v1/" + h.cfg.Mount + "/data/{path...}"
+	mux.HandleFunc("GET "+data, h.readSecret)
+	mux.HandleFunc("PUT "+data, h.writeSecret)
+	mux.HandleFunc("POST "+data, h.writeSecret)
+
+	mux.HandleFunc("/", h.notFound)
 	return mux
+}
+
+// notFound keeps unmatched routes in the error shape clients parse, rather than
+// letting the mux emit plain text they would fail to decode.
+func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusNotFound, "no handler for route")
 }
 
 // --- routes ---------------------------------------------------------------
@@ -97,6 +114,64 @@ func (h *Handler) mountPreflight(w http.ResponseWriter, r *http.Request) {
 		// The CLI asserts this is a STRING without checking; a number panics it.
 		"options": map[string]any{"version": "2"},
 	}))
+}
+
+// login is the Kubernetes auth method's shape: a workload posts its projected
+// ServiceAccount token and the role it claims, and receives a Signet session.
+//
+// Consumers parse exactly one field of the response — auth.client_token — but
+// they decode the whole object, so every field must be well-formed. The rest is
+// emitted as constants: no consumer in the compat set renews or inspects a
+// lease (E-06).
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		JWT  string `json:"jwt"`
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	if body.JWT == "" || body.Role == "" {
+		writeErr(w, http.StatusBadRequest, "both 'jwt' and 'role' are required")
+		return
+	}
+
+	// The dialect hands the material over untouched — it never parses or trusts
+	// it. Verification and mapping are the kernel's, so a bug here cannot
+	// become an authentication bypass.
+	token, s, err := h.k.Login(r.Context(), kernel.Evidence{Rule: body.Role, Material: []byte(body.JWT)})
+	if err != nil {
+		// Authentication failures are deliberately uniform to the caller; the
+		// specific reason goes to the audit log, not to whoever is guessing.
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+
+	var ttl int64
+	if s.Expiry != 0 {
+		if ttl = s.Expiry - time.Now().Unix(); ttl < 0 {
+			ttl = 0
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"request_id": "", "lease_id": "", "renewable": false, "lease_duration": 0,
+		"data": nil, "wrap_info": nil, "warnings": nil,
+		"auth": map[string]any{
+			"client_token":   token,
+			"accessor":       string(s.ID),
+			"policies":       []string{},
+			"token_policies": []string{},
+			// Values must be strings: the Go client decodes this into a
+			// map[string]string and a non-string fails the whole response.
+			"metadata":       map[string]string{"principal": string(s.Principal)},
+			"lease_duration": ttl,
+			"renewable":      false,
+			"entity_id":      "",
+			"token_type":     "service",
+			"orphan":         true,
+		},
+	})
 }
 
 func (h *Handler) lookupSelf(w http.ResponseWriter, r *http.Request) {
@@ -228,11 +303,9 @@ func (h *Handler) session(r *http.Request) (kernel.Session, error) {
 	return h.k.LookupSession(r.Context(), tok)
 }
 
-// treePath maps the client's mount+path onto a node in the resource tree.
+// treePath maps the client's mount-relative path onto a node in the resource
+// tree. The mount itself was matched by the route.
 func (h *Handler) treePath(r *http.Request) (string, bool) {
-	if r.PathValue("mount") != h.cfg.Mount {
-		return "", false
-	}
 	rest := strings.Trim(r.PathValue("path"), "/")
 	if rest == "" {
 		return "", false

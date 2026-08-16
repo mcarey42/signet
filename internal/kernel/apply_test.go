@@ -149,6 +149,87 @@ func TestDelegationOnlyNarrows(t *testing.T) {
 	}
 }
 
+// A mapping rule decides who a caller gets to *be*, so it is an
+// authorization-bearing write: an admin of a subtree may only map identities
+// onto principals inside it. Without this, a delegated admin could point their
+// own workload at a superior principal — the ESC1 shape, arrived at through
+// authentication config rather than through a grant.
+func TestMappingRulesObeyDelegationNarrows(t *testing.T) {
+	s := newStore(t, newSealKey(t))
+	root := bootstrap(t, s)
+
+	mustApply(t, s, 3, &op.PutIssuer{
+		Header: op.Header{Actor: root, AtSec: 1000}, ID: "iss1", Name: "cluster",
+		Verifier: "k8s-sa", URL: "https://k8s.example", Audience: "signet",
+		JWKS: []byte(`{"keys":[{"kty":"RSA","kid":"k","n":"AQAB","e":"AQAB"}]}`), Grantor: root,
+	})
+	// A delegated admin, and two principals: one inside their subtree, one not.
+	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "labadmin", Path: "/people/labadmin", Type: "human"})
+	mustApply(t, s, 5, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-lab", Subject: "labadmin", Role: "domain-admin", Scope: "/clusters/lab", Grantor: root})
+	mustApply(t, s, 6, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "inside", Path: "/clusters/lab/apps/runner", Type: "workload"})
+	mustApply(t, s, 7, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "outside", Path: "/clusters/prod/apps/billing", Type: "workload"})
+
+	inScope := &op.PutMapping{
+		Header: op.Header{Actor: "labadmin", AtSec: 1000}, ID: "m1", Name: "lab-runner",
+		Issuer: "cluster", Namespaces: []string{"lab"}, ServiceAccounts: []string{"runner"},
+		Principal: "inside", Grantor: "labadmin",
+	}
+	if res := apply(t, s, 8, inScope); res.Err != nil {
+		t.Fatalf("mapping inside the delegated subtree was rejected: %v", res.Err)
+	}
+
+	escalation := &op.PutMapping{
+		Header: op.Header{Actor: "labadmin", AtSec: 1000}, ID: "m2", Name: "escalate",
+		Issuer: "cluster", Namespaces: []string{"lab"}, ServiceAccounts: []string{"runner"},
+		Principal: "outside", Grantor: "labadmin",
+	}
+	if res := apply(t, s, 9, escalation); res.Err == nil {
+		t.Fatal("a subtree admin mapped an identity onto a principal outside their subtree")
+	}
+
+	// Registering a trust anchor decides whose signatures are believed at all,
+	// so it is domain-wide authority — a subtree admin cannot do it.
+	rogue := &op.PutIssuer{
+		Header: op.Header{Actor: "labadmin", AtSec: 1000}, ID: "iss2", Name: "rogue",
+		Verifier: "k8s-sa", URL: "https://evil.example", Audience: "signet",
+		JWKS: []byte(`{"keys":[]}`), Grantor: "labadmin",
+	}
+	if res := apply(t, s, 10, rogue); res.Err == nil {
+		t.Fatal("a subtree admin registered a trust anchor")
+	}
+}
+
+// A mapping must state what it accepts. An empty matcher list matching
+// everything would be an authentication bypass, so it matches nothing.
+func TestMappingRequiresExplicitMatchers(t *testing.T) {
+	s := newStore(t, newSealKey(t))
+	root := bootstrap(t, s)
+	mustApply(t, s, 3, &op.PutIssuer{
+		Header: op.Header{Actor: root, AtSec: 1000}, ID: "iss1", Name: "cluster",
+		Verifier: "k8s-sa", URL: "https://k8s.example", Audience: "signet",
+		JWKS: []byte(`{"keys":[]}`), Grantor: root,
+	})
+	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "wl", Path: "/apps/wl", Type: "workload"})
+
+	if res := apply(t, s, 5, &op.PutMapping{
+		Header: op.Header{Actor: root, AtSec: 1000}, ID: "m", Name: "wide",
+		Issuer: "cluster", Principal: "wl", Grantor: root, // no matchers at all
+	}); res.Err == nil {
+		t.Fatal("a mapping with no namespace/service-account matchers was accepted")
+	}
+
+	m := Mapping{Namespaces: []string{"demo"}, ServiceAccounts: []string{"client"}}
+	if m.Matches("other", "client") || m.Matches("demo", "other") {
+		t.Error("Matches accepted a non-listed namespace or account")
+	}
+	if !m.Matches("demo", "client") {
+		t.Error("Matches rejected the listed pair")
+	}
+	if (Mapping{}).Matches("", "") {
+		t.Error("an empty mapping matched something")
+	}
+}
+
 // Bootstrap — the one binding with no grantor — is legal exactly once, while
 // the domain holds no bindings at all.
 func TestBootstrapIsSingleUse(t *testing.T) {

@@ -16,8 +16,13 @@ metadata:
   name: signet-genesis
   namespace: signet
 data:
-  # Desired state only: who exists and what they may do. The workload that ESO
-  # runs as is scoped to one subtree of the secret tree.
+  # Desired state only: who exists, what they may do, and which attested
+  # identities become them. Kubernetes is trusted as an attestation source —
+  # the cluster already proves what a workload is, so no agent is deployed and
+  # no shared secret is distributed.
+  #
+  # The issuer's key set is pinned from a file (mounted separately, fetched out
+  # of band) rather than discovered at request time.
   genesis.json: |
     {
       "principals": [
@@ -27,6 +32,21 @@ data:
         {"subject": "/clusters/svc/apps/eso",
          "role": "kv-reader",
          "scope": "/secrets/cluster-svc"}
+      ],
+      "issuers": [
+        {"name": "this-cluster",
+         "verifier": "k8s-sa",
+         "url": "https://kubernetes.default.svc.cluster.local",
+         "audience": "signet",
+         "jwks_file": "/jwks/jwks.json"}
+      ],
+      "mappings": [
+        {"name": "eso",
+         "issuer": "this-cluster",
+         "namespaces": ["demo"],
+         "service_accounts": ["signet-client"],
+         "principal": "/clusters/svc/apps/eso",
+         "ttl_seconds": 900}
       ]
     }
 ---
@@ -58,6 +78,7 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: config, mountPath: /config}
+            - {name: jwks, mountPath: /jwks}
       containers:
         - name: signet
           image: signet:dev
@@ -79,6 +100,9 @@ spec:
       volumes:
         - {name: data, emptyDir: {}}
         - {name: config, configMap: {name: signet-genesis}}
+        # Pinned out of band by the test script from the live cluster's OIDC
+        # discovery endpoint — Signet never fetches keys from a request.
+        - {name: jwks, configMap: {name: signet-jwks}}
 ---
 apiVersion: v1
 kind: Service

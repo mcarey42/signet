@@ -38,9 +38,14 @@ the same object: a signed claim of *who, what scope, until when*.
 
 ## Status
 
-**MVP scaffold, first checkpoint green.** A single-node domain runs: genesis
-initializes it, the Vault-compatible KV dialect serves reads and writes, scoped
-RBAC bounds them, and state survives restart. See
+**MVP complete.** Unmodified [External Secrets Operator](https://external-secrets.io)
+reads secrets from Signet in a live Kubernetes cluster, authenticating as its
+own workload identity — no shared secret, no agent, no client changes. Run it
+yourself with `./test/kind/run.sh`.
+
+A single-node domain: genesis initializes it, Kubernetes ServiceAccount tokens
+attest workloads, scoped RBAC bounds what each may read, the Vault-compatible
+dialect serves them, and state survives restart. See
 [docs/15-mvp-plan.md](docs/15-mvp-plan.md) for what is deliberately deferred
 (OIDC, SSH, agents, federation, internal CA) and [docs/](docs/README.md) for the
 design record behind every decision.

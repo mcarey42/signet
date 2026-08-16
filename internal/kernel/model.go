@@ -51,6 +51,45 @@ type Secret struct {
 	ModifiedSec int64             `json:"modified"`
 }
 
+// Issuer is a pinned attestation trust anchor (docs/04).
+type Issuer struct {
+	ID       op.ID  `json:"id"`
+	Name     string `json:"name"`
+	Verifier string `json:"verifier"`
+	URL      string `json:"url"`
+	Audience string `json:"audience"`
+	JWKS     []byte `json:"jwks"`
+}
+
+// Mapping translates a verified identity into a principal. Matchers are exact
+// lists, deliberately not patterns.
+type Mapping struct {
+	ID              op.ID    `json:"id"`
+	Name            string   `json:"name"`
+	Issuer          string   `json:"issuer"`
+	Namespaces      []string `json:"namespaces"`
+	ServiceAccounts []string `json:"service_accounts"`
+	Principal       op.ID    `json:"principal"`
+	TTLSeconds      int64    `json:"ttl_seconds"`
+	Grantor         op.ID    `json:"grantor"`
+}
+
+// Matches reports whether a verified identity satisfies this rule. An empty
+// matcher list matches nothing: a rule must say what it accepts, because a
+// rule that accidentally accepts everything is an authentication bypass.
+func (m Mapping) Matches(namespace, account string) bool {
+	return containsExact(m.Namespaces, namespace) && containsExact(m.ServiceAccounts, account)
+}
+
+func containsExact(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 // Verb is the kernel's authorization vocabulary. Dialects map their own wire
 // surface onto it; the kernel never learns Vault's or OIDC's nouns.
 type Verb string
