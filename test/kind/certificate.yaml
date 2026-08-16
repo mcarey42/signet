@@ -1,0 +1,91 @@
+# cert-manager issuing from Signet's CA, authenticating as a Kubernetes
+# workload — the same attestation path ESO uses, now for certificates.
+#
+# Nothing here holds a secret either: cert-manager asks Kubernetes for a token
+# proving which ServiceAccount it acts as, Signet maps that to a principal, and
+# the principal's pki-signer binding at /pki/server is what permits issuance.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: certmanager-client
+  namespace: demo
+---
+# cert-manager needs to mint tokens for that ServiceAccount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: certmanager-token
+  namespace: demo
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["certmanager-client"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: certmanager-token
+  namespace: demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: certmanager-token
+subjects:
+  - kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: signet
+  namespace: demo
+spec:
+  vault:
+    server: http://signet.signet.svc:8200
+    # The signing role. Signet checks the requester's authority at the role's
+    # scope, then bounds every name in the request by the role's own rules.
+    path: pki-home-solcore-dot-net/sign/server
+    auth:
+      kubernetes:
+        mountPath: /v1/auth/kubernetes
+        role: certmanager # names Signet's mapping rule
+        serviceAccountRef:
+          name: certmanager-client
+          audiences: ["signet"]
+---
+# In scope for the role: *.demo.example.com
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: demo-tls
+  namespace: demo
+spec:
+  secretName: demo-tls
+  duration: 720h
+  issuerRef:
+    name: signet
+    kind: Issuer
+  commonName: app.demo.example.com
+  dnsNames:
+    - app.demo.example.com
+    - api.demo.example.com
+---
+# Out of scope: the role permits neither this domain nor anything under it.
+# cert-manager will report the refusal rather than obtaining a certificate.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: forbidden-tls
+  namespace: demo
+spec:
+  secretName: forbidden-tls
+  duration: 720h
+  issuerRef:
+    name: signet
+    kind: Issuer
+  commonName: app.evil.example
+  dnsNames:
+    - app.evil.example

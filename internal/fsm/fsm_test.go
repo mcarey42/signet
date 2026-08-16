@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mcarey/signet/internal/fsm"
-	"github.com/mcarey/signet/internal/kernel"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/fsm"
+	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // openNode brings up a domain over a fixed directory, so a test can close it

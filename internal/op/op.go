@@ -38,6 +38,9 @@ const (
 	KindVersionAction Kind = 8
 	KindDestroySecret Kind = 9
 	KindPutSecretMeta Kind = 10
+	KindPutCA         Kind = 11
+	KindPutPKIRole    Kind = 12
+	KindRecordIssue   Kind = 13
 )
 
 func (k Kind) String() string {
@@ -62,6 +65,12 @@ func (k Kind) String() string {
 		return "DestroySecret"
 	case KindPutSecretMeta:
 		return "PutSecretMeta"
+	case KindPutCA:
+		return "PutCA"
+	case KindPutPKIRole:
+		return "PutPKIRole"
+	case KindRecordIssue:
+		return "RecordIssuance"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -164,6 +173,38 @@ type PutSecretMeta struct {
 	CASRequired    bool              `json:"cas_required,omitempty"`
 }
 
+// PutCA installs a certificate authority. The material carries the root
+// certificate, the intermediate, and the intermediate's private key — never the
+// root's, which the genesis ceremony hands to the operator instead of writing
+// anywhere (docs/14, E-13 F6).
+type PutCA struct {
+	Header
+	Name     string `json:"name"`
+	Material []byte `json:"material"` // JSON-encoded ca.Material
+	Grantor  ID     `json:"grantor"`
+}
+
+// PutPKIRole defines what a signing request may ask for.
+type PutPKIRole struct {
+	Header
+	Name    string `json:"name"`
+	Role    []byte `json:"role"` // JSON-encoded ca.Role
+	Grantor ID     `json:"grantor"`
+}
+
+// RecordIssuance appends to the domain's issuance log. Every signature the CA
+// key makes is recorded, so a certificate that exists but is absent from the
+// log is the signal that the key was used outside Signet (docs/02).
+type RecordIssuance struct {
+	Header
+	Serial    string   `json:"serial"`
+	Role      string   `json:"role"`
+	Subject   string   `json:"subject"`
+	SANs      []string `json:"sans"`
+	NotAfter  int64    `json:"not_after"`
+	Requester ID       `json:"requester"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -197,16 +238,19 @@ type PutMapping struct {
 	Grantor         ID       `json:"grantor"`
 }
 
-func (PutPrincipal) OpKind() Kind  { return KindPutPrincipal }
-func (PutBinding) OpKind() Kind    { return KindPutBinding }
-func (PutSecret) OpKind() Kind     { return KindPutSecret }
-func (CreateSession) OpKind() Kind { return KindCreateSession }
-func (RevokeSession) OpKind() Kind { return KindRevokeSession }
-func (PutIssuer) OpKind() Kind     { return KindPutIssuer }
-func (VersionAction) OpKind() Kind { return KindVersionAction }
-func (DestroySecret) OpKind() Kind { return KindDestroySecret }
-func (PutSecretMeta) OpKind() Kind { return KindPutSecretMeta }
-func (PutMapping) OpKind() Kind    { return KindPutMapping }
+func (PutPrincipal) OpKind() Kind   { return KindPutPrincipal }
+func (PutBinding) OpKind() Kind     { return KindPutBinding }
+func (PutSecret) OpKind() Kind      { return KindPutSecret }
+func (CreateSession) OpKind() Kind  { return KindCreateSession }
+func (RevokeSession) OpKind() Kind  { return KindRevokeSession }
+func (PutIssuer) OpKind() Kind      { return KindPutIssuer }
+func (VersionAction) OpKind() Kind  { return KindVersionAction }
+func (DestroySecret) OpKind() Kind  { return KindDestroySecret }
+func (PutSecretMeta) OpKind() Kind  { return KindPutSecretMeta }
+func (PutMapping) OpKind() Kind     { return KindPutMapping }
+func (PutCA) OpKind() Kind          { return KindPutCA }
+func (PutPKIRole) OpKind() Kind     { return KindPutPKIRole }
+func (RecordIssuance) OpKind() Kind { return KindRecordIssue }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -277,6 +321,15 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindPutSecretMeta:
 		var v PutSecretMeta
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutCA:
+		var v PutCA
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutPKIRole:
+		var v PutPKIRole
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindRecordIssue:
+		var v RecordIssuance
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

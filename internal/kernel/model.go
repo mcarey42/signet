@@ -3,7 +3,7 @@ package kernel
 import (
 	"fmt"
 
-	"github.com/mcarey/signet/internal/op"
+	"github.com/mcarey42/signet/internal/op"
 )
 
 // Principal is anything that can hold a credential. The ID is stable and never
@@ -128,6 +128,9 @@ const (
 	VerbWrite  Verb = "write"
 	VerbDelete Verb = "delete"
 	VerbAdmin  Verb = "admin"
+	// VerbSign is certificate issuance. It is its own verb because the right to
+	// mint an identity is not the right to write a secret.
+	VerbSign Verb = "sign"
 )
 
 // Reserved roles for the MVP. These are Signet-dialect-owned mappings — the
@@ -137,7 +140,8 @@ var roleVerbs = map[string]map[Verb]bool{
 	"kv-reader":    {VerbRead: true, VerbList: true},
 	"kv-writer":    {VerbRead: true, VerbList: true, VerbWrite: true},
 	"kv-admin":     {VerbRead: true, VerbList: true, VerbWrite: true, VerbDelete: true},
-	"domain-admin": {VerbRead: true, VerbList: true, VerbWrite: true, VerbDelete: true, VerbAdmin: true},
+	"pki-signer":   {VerbSign: true},
+	"domain-admin": {VerbRead: true, VerbList: true, VerbWrite: true, VerbDelete: true, VerbAdmin: true, VerbSign: true},
 }
 
 // adminRoles may create bindings (subject to delegation-only-narrows).

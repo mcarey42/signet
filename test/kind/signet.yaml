@@ -26,12 +26,24 @@ data:
   genesis.json: |
     {
       "principals": [
-        {"path": "/clusters/svc/apps/eso", "type": "workload"}
+        {"path": "/clusters/svc/apps/eso", "type": "workload"},
+        {"path": "/clusters/svc/apps/certmanager", "type": "workload"}
       ],
       "bindings": [
         {"subject": "/clusters/svc/apps/eso",
          "role": "kv-reader",
-         "scope": "/secrets/cluster-svc"}
+         "scope": "/secrets/cluster-svc"},
+        {"subject": "/clusters/svc/apps/certmanager",
+         "role": "pki-signer",
+         "scope": "/pki/server"}
+      ],
+      "pki_roles": [
+        {"name": "server",
+         "scope": "/pki/server",
+         "allowed_domains": ["svc.cluster.local", "demo.example.com"],
+         "allow_subdomains": true,
+         "allow_bare_domains": true,
+         "max_ttl_seconds": 7776000}
       ],
       "issuers": [
         {"name": "this-cluster",
@@ -46,6 +58,12 @@ data:
          "namespaces": ["demo"],
          "service_accounts": ["signet-client"],
          "principal": "/clusters/svc/apps/eso",
+         "ttl_seconds": 900},
+        {"name": "certmanager",
+         "issuer": "this-cluster",
+         "namespaces": ["demo"],
+         "service_accounts": ["certmanager-client"],
+         "principal": "/clusters/svc/apps/certmanager",
          "ttl_seconds": 900}
       ]
     }
@@ -75,10 +93,19 @@ spec:
             - -config=/config/genesis.json
             - -mint=/clusters/svc/apps/eso
             - -ttl=24h
+            # The root ceremony. The root key is written outside the data
+            # directory and is never proposed, stored, or backed up.
+            - -ca-common-name=Signet Test
+            - -ca-domains=svc.cluster.local,demo.example.com
+            - -root-key-out=/rootkey/root-ca.key
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: config, mountPath: /config}
             - {name: jwks, mountPath: /jwks}
+            # The ceremony writes the root key here, deliberately outside the
+            # data volume so it is never part of a backup. A real deployment
+            # mounts one-shot storage the operator collects and then destroys.
+            - {name: rootkey, mountPath: /rootkey}
       containers:
         - name: signet
           image: signet:dev
@@ -89,6 +116,7 @@ spec:
             - -listen=0.0.0.0:8200
             - -mount=secrets-home-solcore-dot-net
             - -tree-prefix=/secrets
+            - -pki-mount=pki-home-solcore-dot-net
           ports:
             - {name: api, containerPort: 8200}
           readinessProbe:
@@ -103,6 +131,7 @@ spec:
         # Pinned out of band by the test script from the live cluster's OIDC
         # discovery endpoint — Signet never fetches keys from a request.
         - {name: jwks, configMap: {name: signet-jwks}}
+        - {name: rootkey, emptyDir: {}}
 ---
 apiVersion: v1
 kind: Service

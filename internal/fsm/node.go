@@ -10,8 +10,8 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // Node is one Signet domain member: the store, the FSM, and the Raft instance

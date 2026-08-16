@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // Apply is the single write path. Every mutation in Signet passes through this
@@ -49,6 +49,12 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyDestroySecret(tx, v)
 	case *op.PutSecretMeta:
 		return applyPutSecretMeta(tx, v)
+	case *op.PutCA:
+		return applyPutCA(tx, v)
+	case *op.PutPKIRole:
+		return applyPutPKIRole(tx, v)
+	case *op.RecordIssuance:
+		return applyRecordIssuance(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -308,6 +314,12 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 		r.Error = res.Err.Error()
 	}
 	switch v := o.(type) {
+	case *op.PutCA:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
+	case *op.PutPKIRole:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
+	case *op.RecordIssuance:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Serial
 	case *op.PutIssuer:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutMapping:

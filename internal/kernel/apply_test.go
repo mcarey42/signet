@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 func newStore(t *testing.T, keyPath string) *store.Store {

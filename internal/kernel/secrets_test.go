@@ -3,8 +3,8 @@ package kernel
 import (
 	"testing"
 
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 func readVersion(t *testing.T, s *store.Store, path string, version uint64) (map[string]string, bool) {

@@ -290,8 +290,33 @@ final one, not a fork.
 ## Milestones after the slice (orientation, not scope)
 
 1. **Slice**: ESO reads a secret (this doc).
-2. **Consumers**: full Vault Tier A (KV history/CAS, `bao` CLI, inframonitor
-   health) + cert-manager `pki/sign` — brings the internal CA + F6 root ceremony.
+2. ✅ **Consumers — DONE (2026-08-16).** Full Vault Tier A plus the internal CA.
+   - **KV v2 complete**: version history, versioned reads, metadata, list,
+     soft delete / undelete / destroy, CAS and `cas_required`, `max_versions`
+     trimming. Verified against **bao v2.5.5**, the CLI this homelab uses.
+   - **PKI**: `pki/sign/{role}`, `ca/pem`, `ca_chain`. **cert-manager v1.19**
+     in kind obtains certificates from Signet, authenticating as its own
+     Kubernetes workload — and the result verifies under **openssl**, an
+     independent TLS stack.
+   - **The F6 root ceremony is real**: the root key is generated in the
+     ceremony, signs exactly one intermediate, and is written to a file outside
+     the data directory. Verified empirically that it appears nowhere in
+     `state.db` or `raft.db`. Genesis is idempotent — a domain that already has
+     an authority keeps it, since a second root would orphan everything issued
+     under the first.
+   - **Verify-after-sign (charter principle 6) is implemented and tested**:
+     every certificate is re-parsed from its own bytes and re-checked — chain,
+     CA bit, TTL, and every SAN — through a separate code path before release.
+     Tests forge the certificates a buggy builder would emit (wrong domain,
+     over-long TTL, CA bit set, no SANs) and confirm the gate refuses them.
+
+   **Second compat bug found by a real client** (E-06 surveyed only ESO's
+   routes): the `bao` CLI sends version numbers as JSON **strings**. Go's
+   decoder reports the type error but has already appended a zero, so "undelete
+   version 1" silently became "act on version 0" — a no-op that returned 204.
+   A destructive-adjacent call that quietly does nothing while reporting
+   success is the worst available failure, so the decoder now accepts both
+   forms and rejects anything else.
 3. **Offline dialects**: OIDC + SSH CA — brings `keys`, signing/JOSE, the
    freshness ladder, `Issue`, verify-after-sign, and the agent.
 4. **Multi-domain**: root + home/aws/gcp, federation, sovereign-mode test.

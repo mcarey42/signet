@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 
 	"github.com/hashicorp/raft"
-	"github.com/mcarey/signet/internal/kernel"
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // opAAD binds an encrypted log payload to its purpose.

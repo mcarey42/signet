@@ -1,0 +1,237 @@
+package kernel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/mcarey42/signet/internal/ca"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
+)
+
+// The PKI dialect is a serializer over these methods. Certificate issuance is
+// the one place where authorization, an independent verification gate, and the
+// issuance log all have to line up, so all three live here rather than in the
+// dialect (charter principles 5 and 6).
+
+func applyPutCA(tx *store.Tx, o *op.PutCA) op.Result {
+	if o.Name == "" || len(o.Material) == 0 {
+		return op.Result{Err: errors.New("ca: missing name or material")}
+	}
+	// Installing an authority is domain-wide power: whoever controls the CA
+	// controls every identity it can assert.
+	if err := requireDomainAuthority(tx, o.Grantor, o.AtSec); err != nil {
+		return op.Result{Err: fmt.Errorf("ca: %w", err)}
+	}
+	var m ca.Material
+	if err := json.Unmarshal(o.Material, &m); err != nil {
+		return op.Result{Err: fmt.Errorf("ca: material: %w", err)}
+	}
+	// Refuse to store anything that is not a loadable authority, and refuse
+	// outright if a root private key was included — that must never reach the
+	// log, and catching it here is cheaper than discovering it in a backup.
+	if _, err := ca.Load(m); err != nil {
+		return op.Result{Err: err}
+	}
+	if err := tx.Put(store.BucketCA, o.Name, o.Material); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{}
+}
+
+func applyPutPKIRole(tx *store.Tx, o *op.PutPKIRole) op.Result {
+	if o.Name == "" {
+		return op.Result{Err: errors.New("pki role: missing name")}
+	}
+	var role ca.Role
+	if err := json.Unmarshal(o.Role, &role); err != nil {
+		return op.Result{Err: fmt.Errorf("pki role: %w", err)}
+	}
+	if err := ValidatePath(role.Scope); err != nil {
+		return op.Result{Err: fmt.Errorf("pki role scope: %w", err)}
+	}
+	if len(role.AllowedDomains) == 0 && len(role.AllowedURIPrefix) == 0 {
+		return op.Result{Err: errors.New("pki role: must permit at least one domain or URI prefix")}
+	}
+	// A role is what bounds every certificate issued through it, so defining one
+	// narrows exactly like a grant: an admin may only create roles that issue
+	// within their own subtree.
+	if o.Grantor == "" {
+		return op.Result{Err: errors.New("pki role: missing grantor")}
+	}
+	ok, err := HasAuthority(tx, o.Grantor, VerbAdmin, role.Scope, o.AtSec)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if !ok {
+		return op.Result{Err: fmt.Errorf("pki role: grantor %s lacks admin authority at %s", o.Grantor, role.Scope)}
+	}
+	if err := tx.Put(store.BucketPKIRoles, o.Name, o.Role); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{}
+}
+
+func applyRecordIssuance(tx *store.Tx, o *op.RecordIssuance) op.Result {
+	if o.Serial == "" {
+		return op.Result{Err: errors.New("issuance: missing serial")}
+	}
+	rec := IssuanceRecord{
+		Serial: o.Serial, Role: o.Role, Subject: o.Subject, SANs: o.SANs,
+		NotAfter: o.NotAfter, Requester: o.Requester, IssuedSec: o.AtSec,
+	}
+	blob, err := json.Marshal(rec)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if err := tx.Put(store.BucketIssuance, o.Serial, blob); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{}
+}
+
+// IssuanceRecord is one line of the domain's append-only issuance log.
+type IssuanceRecord struct {
+	Serial    string   `json:"serial"`
+	Role      string   `json:"role"`
+	Subject   string   `json:"subject"`
+	SANs      []string `json:"sans"`
+	NotAfter  int64    `json:"not_after"`
+	Requester op.ID    `json:"requester"`
+	IssuedSec int64    `json:"issued"`
+}
+
+// --- service methods ------------------------------------------------------
+
+// InstallCA stores a CA created by the genesis ceremony.
+func (k *Kernel) InstallCA(ctx context.Context, grantor op.ID, name string, m ca.Material) error {
+	blob, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	_, err = k.prop.Propose(ctx, &op.PutCA{Header: k.header(grantor), Name: name, Material: blob, Grantor: grantor})
+	return err
+}
+
+// PutPKIRole defines a signing role.
+func (k *Kernel) PutPKIRole(ctx context.Context, grantor op.ID, role ca.Role) error {
+	blob, err := json.Marshal(role)
+	if err != nil {
+		return err
+	}
+	_, err = k.prop.Propose(ctx, &op.PutPKIRole{Header: k.header(grantor), Name: role.Name, Role: blob, Grantor: grantor})
+	return err
+}
+
+// CAChain returns the trust material clients need, which is public by design.
+func (k *Kernel) CAChain(ctx context.Context, name string) (root, chain []byte, err error) {
+	err = k.store.View(func(tx *store.Tx) error {
+		authority, err := loadCA(tx, name)
+		if err != nil {
+			return err
+		}
+		root, chain = authority.RootPEM(), authority.ChainPEM()
+		return nil
+	})
+	return root, chain, err
+}
+
+// SignCertificate authorizes a request, issues, verifies, and logs.
+//
+// The order is deliberate: the caller's authority is checked against the role's
+// scope before the CA key is touched at all, the certificate is independently
+// re-verified before it is returned, and the issuance is recorded before the
+// caller receives anything. A certificate the log does not know about is the
+// signal that the key was used outside Signet.
+func (k *Kernel) SignCertificate(ctx context.Context, s Session, caName, roleName string, req ca.Request) (*ca.Issued, error) {
+	var (
+		authority *ca.CA
+		role      ca.Role
+	)
+	if err := k.store.View(func(tx *store.Tx) error {
+		raw, ok, err := tx.Get(store.BucketPKIRoles, roleName)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: pki role %q", ErrNotFound, roleName)
+		}
+		if err := json.Unmarshal(raw, &role); err != nil {
+			return err
+		}
+		allowed, err := HasAuthority(tx, s.Principal, VerbSign, role.Scope, k.now().Unix())
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return ErrDenied
+		}
+		authority, err = loadCA(tx, caName)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+
+	serial, err := ca.NewSerial()
+	if err != nil {
+		return nil, err
+	}
+	issued, err := authority.Sign(req, role, serial, k.now())
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := k.prop.Propose(ctx, &op.RecordIssuance{
+		Header: k.header(s.Principal), Serial: issued.Serial, Role: roleName,
+		Subject: issued.Subject, SANs: issued.SANs,
+		NotAfter: issued.NotAfter.Unix(), Requester: s.Principal,
+	}); err != nil {
+		// The certificate exists but the log does not know about it, so it is
+		// not handed over. It never left this process.
+		return nil, fmt.Errorf("issuance not recorded, certificate withheld: %w", err)
+	}
+	return issued, nil
+}
+
+func loadCA(tx *store.Tx, name string) (*ca.CA, error) {
+	raw, ok, err := tx.Get(store.BucketCA, name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: certificate authority %q", ErrNotFound, name)
+	}
+	var m ca.Material
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	return ca.Load(m)
+}
+
+// IssuanceLog returns recorded issuances, newest serials last. It is an
+// operator view; the audit log proper is separate.
+func (k *Kernel) IssuanceLog(ctx context.Context, s Session) ([]IssuanceRecord, error) {
+	if err := k.authorize(s, VerbAdmin, "/"); err != nil {
+		return nil, err
+	}
+	var out []IssuanceRecord
+	err := k.store.View(func(tx *store.Tx) error {
+		return tx.ScanPrefix(store.BucketIssuance, "", func(_ string, val []byte) bool {
+			var r IssuanceRecord
+			if json.Unmarshal(val, &r) == nil {
+				out = append(out, r)
+			}
+			return true
+		})
+	})
+	return out, err
+}
+
+// GenesisCA runs a root ceremony. The root private key is returned to the
+// caller and never stored.
+func GenesisCA(commonName string, permittedDNS []string, rootTTL, interTTL time.Duration) (*ca.GenesisResult, error) {
+	return ca.Genesis(commonName, permittedDNS, rootTTL, interTTL, time.Now())
+}

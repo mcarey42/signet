@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // Secret storage keeps metadata and values apart: the version history lives in

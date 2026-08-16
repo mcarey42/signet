@@ -114,6 +114,44 @@ for name in forbidden missing impostor; do
 	fi
 done
 
+say "install cert-manager and issue a certificate from Signet's CA"
+helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
+helm repo update >/dev/null
+helm --kube-context "$CTX" upgrade --install cert-manager jetstack/cert-manager \
+	-n cert-manager --create-namespace --set crds.enabled=true --wait --timeout 8m >/dev/null
+k apply -f "$HERE/certificate.yaml"
+for _ in $(seq 1 40); do
+	[[ $(k -n demo get certificate demo-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) == "True" ]] && break
+	sleep 3
+done
+k -n demo get certificate -o custom-columns=\
+'NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,MESSAGE:.status.conditions[?(@.type=="Ready")].message' | cut -c1-110
+echo
+if [[ $(k -n demo get certificate demo-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}') == "True" ]]; then
+	k -n demo get secret demo-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$BUILD/issued.crt"
+	subject=$(openssl x509 -in "$BUILD/issued.crt" -noout -subject 2>/dev/null)
+	echo "PASS  cert-manager obtained a certificate from Signet: $subject"
+	# Verify it against the CA Signet published, using a different TLS stack.
+	k -n signet port-forward svc/signet 8300:8200 >/dev/null 2>&1 &
+	PF=$!
+	until curl -sf localhost:8300/v1/sys/health >/dev/null 2>&1; do sleep 0.25; done
+	curl -sf "localhost:8300/v1/pki-home-solcore-dot-net/ca_chain" > "$BUILD/chain.pem"
+	kill $PF 2>/dev/null || true
+	if openssl verify -CAfile "$BUILD/chain.pem" "$BUILD/issued.crt" >/dev/null 2>&1; then
+		echo "PASS  the issued certificate verifies against Signet's published chain (openssl)"
+	else
+		echo "FAIL  the issued certificate does not verify against the published chain"; fail=1
+	fi
+else
+	echo "FAIL  cert-manager could not obtain a certificate"; fail=1
+fi
+forbidden=$(k -n demo get certificate forbidden-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+if [[ $forbidden != "True" ]]; then
+	echo "PASS  the out-of-scope certificate was refused by the signing role"
+else
+	echo "FAIL  a certificate outside the role's domains was issued"; fail=1
+fi
+
 say "live rotation"
 k -n signet port-forward svc/signet 8300:8200 >/dev/null 2>&1 &
 PF=$!

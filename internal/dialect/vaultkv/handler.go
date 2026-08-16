@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mcarey/signet/internal/kernel"
-	"github.com/mcarey/signet/internal/op"
+	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/op"
 )
 
 // Status is the server-side view sys/health reports. Sealing and consensus are
@@ -39,7 +39,11 @@ type Config struct {
 	// TreePrefix is where that mount lands in the resource tree. Secrets are
 	// tree nodes, so scope machinery applies to them for free (docs/13 F8).
 	TreePrefix string
-	Status     func() Status
+	// PKIMount is the mount clients address for certificate signing, e.g.
+	// "pki-home-solcore-dot-net". Empty disables the PKI routes.
+	PKIMount string
+	CAName   string
+	Status   func() Status
 }
 
 type Handler struct {
@@ -50,6 +54,9 @@ type Handler struct {
 func New(k *kernel.Kernel, cfg Config) *Handler {
 	if cfg.TreePrefix == "" {
 		cfg.TreePrefix = "/secrets"
+	}
+	if cfg.CAName == "" {
+		cfg.CAName = "default"
 	}
 	return &Handler{k: k, cfg: cfg}
 }
@@ -92,6 +99,8 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("POST "+m+"/undelete/{path...}", h.versionAction(op.VersionUndelete))
 	mux.HandleFunc("PUT "+m+"/destroy/{path...}", h.versionAction(op.VersionDestroy))
 	mux.HandleFunc("POST "+m+"/destroy/{path...}", h.versionAction(op.VersionDestroy))
+
+	h.pkiRoutes(mux)
 
 	mux.HandleFunc("/", h.notFound)
 	return mux

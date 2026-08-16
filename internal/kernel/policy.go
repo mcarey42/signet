@@ -3,8 +3,8 @@ package kernel
 import (
 	"encoding/json"
 
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // LoadBindings returns every binding held by a subject. Bindings are keyed

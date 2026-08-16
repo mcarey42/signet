@@ -1,4 +1,4 @@
-module github.com/mcarey/signet
+module github.com/mcarey42/signet
 
 go 1.24
 

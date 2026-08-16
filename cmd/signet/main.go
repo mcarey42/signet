@@ -16,14 +16,16 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/mcarey/signet/internal/dialect/vaultkv"
-	"github.com/mcarey/signet/internal/fsm"
-	"github.com/mcarey/signet/internal/kernel"
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/ca"
+	"github.com/mcarey42/signet/internal/dialect/vaultkv"
+	"github.com/mcarey42/signet/internal/fsm"
+	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
@@ -96,6 +98,15 @@ type GenesisConfig struct {
 		Principal       string   `json:"principal"` // principal path
 		TTLSeconds      int64    `json:"ttl_seconds"`
 	} `json:"mappings"`
+	PKIRoles []struct {
+		Name             string   `json:"name"`
+		Scope            string   `json:"scope"`
+		AllowedDomains   []string `json:"allowed_domains"`
+		AllowSubdomains  bool     `json:"allow_subdomains"`
+		AllowBareDomains bool     `json:"allow_bare_domains"`
+		AllowIPSANs      bool     `json:"allow_ip_sans"`
+		MaxTTLSeconds    int64    `json:"max_ttl_seconds"`
+	} `json:"pki_roles"`
 }
 
 func cmdGenesis(args []string) error {
@@ -106,6 +117,9 @@ func cmdGenesis(args []string) error {
 	rootPath := fs.String("root-path", "/people/root", "path of the bootstrap admin principal")
 	ttl := fs.Duration("ttl", 12*time.Hour, "root token lifetime")
 	mint := fs.String("mint", "", "comma-separated principal paths to also mint tokens for")
+	caCN := fs.String("ca-common-name", "", "create a certificate authority with this name (skipped if empty)")
+	caDomains := fs.String("ca-domains", "", "comma-separated DNS domains the CA may issue for")
+	rootKeyOut := fs.String("root-key-out", "", "where to write the root private key (default DATA-DIR/../root-ca.key)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -157,6 +171,12 @@ func cmdGenesis(args []string) error {
 		}
 	}
 
+	if *caCN != "" {
+		if err := genesisCA(ctx, k, rootID, *caCN, *caDomains, caKeyPath(*dataDir, *rootKeyOut)); err != nil {
+			return err
+		}
+	}
+
 	token, _, err := k.CreateSession(ctx, rootID, rootID, *ttl, []string{"genesis"}, "bootstrap")
 	if err != nil {
 		return err
@@ -184,6 +204,67 @@ func cmdGenesis(args []string) error {
 		fmt.Printf("  token %s: %s\n", path, t)
 	}
 	return nil
+}
+
+// genesisCA runs the root ceremony.
+//
+// The root private key is generated here, signs exactly one intermediate, and
+// is written to a file outside the data directory — never proposed, never
+// stored. Everything written to the FSM lands in the Raft log and in every
+// backup generation built from it, so a root key that touched state would make
+// "the root is offline" false forever after (docs/14, E-13 F6).
+func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, domains, rootKeyPath string) error {
+	// Idempotent like the rest of genesis: a domain that already has an
+	// authority keeps it. Minting a second root would orphan every certificate
+	// issued under the first.
+	if _, _, err := k.CAChain(ctx, "default"); err == nil {
+		fmt.Fprintln(os.Stderr, "  CA already present, leaving it alone")
+		return nil
+	}
+	if _, err := os.Stat(rootKeyPath); err == nil {
+		return fmt.Errorf("genesis: %s already exists; refusing to overwrite a root key", rootKeyPath)
+	}
+	if dir := filepath.Dir(rootKeyPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("genesis: root key directory: %w", err)
+		}
+	}
+	permitted := splitList(domains)
+	res, err := kernel.GenesisCA(commonName, permitted, 10*365*24*time.Hour, 365*24*time.Hour)
+	if err != nil {
+		return err
+	}
+	// Write the root key before installing the CA: if this fails, no authority
+	// exists whose root nobody holds.
+	if err := os.WriteFile(rootKeyPath, res.RootKeyPEM, 0o400); err != nil {
+		return fmt.Errorf("genesis: write root key: %w", err)
+	}
+	if err := k.InstallCA(ctx, actor, "default", res.Material); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "  CA %q created for %v\n", commonName, permitted)
+	fmt.Fprintf(os.Stderr, "  ROOT KEY WRITTEN TO %s — move it offline and delete this copy.\n", rootKeyPath)
+	fmt.Fprintf(os.Stderr, "  It is not in the store, the log, or any backup; this file is the only copy.\n")
+	return nil
+}
+
+func caKeyPath(dataDir, override string) string {
+	if override != "" {
+		return override
+	}
+	// Deliberately beside the data directory, not inside it: the data directory
+	// is what gets backed up.
+	return filepath.Join(filepath.Dir(strings.TrimSuffix(dataDir, "/")), "root-ca.key")
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string) error {
@@ -234,6 +315,16 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 		}
 		fmt.Fprintf(os.Stderr, "  mapping %s: %v/%v -> %s\n", m.Name, m.Namespaces, m.ServiceAccounts, m.Principal)
 	}
+	for _, r := range cfg.PKIRoles {
+		if err := k.PutPKIRole(ctx, actor, ca.Role{
+			Name: r.Name, Scope: r.Scope, AllowedDomains: r.AllowedDomains,
+			AllowSubdomains: r.AllowSubdomains, AllowBareDomains: r.AllowBareDomains,
+			AllowIPSANs: r.AllowIPSANs, MaxTTLSeconds: r.MaxTTLSeconds,
+		}); err != nil {
+			return fmt.Errorf("config: pki role %s: %w", r.Name, err)
+		}
+		fmt.Fprintf(os.Stderr, "  pki role %s for %v at %s\n", r.Name, r.AllowedDomains, r.Scope)
+	}
 	return nil
 }
 
@@ -246,6 +337,7 @@ func cmdServe(args []string) error {
 	listen := fs.String("listen", "127.0.0.1:8200", "listen address")
 	mount := fs.String("mount", "secrets", "KV mount name clients address")
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
+	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate (serves plain HTTP if unset)")
 	tlsKey := fs.String("tls-key", "", "TLS private key")
 	if err := fs.Parse(args); err != nil {
@@ -264,6 +356,8 @@ func cmdServe(args []string) error {
 	h := vaultkv.New(k, vaultkv.Config{
 		Mount:      *mount,
 		TreePrefix: *prefix,
+		PKIMount:   *pkiMount,
+		CAName:     "default",
 		Status: func() vaultkv.Status {
 			s := node.Status()
 			return vaultkv.Status{Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader}

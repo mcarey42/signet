@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mcarey/signet/internal/attest"
-	"github.com/mcarey/signet/internal/op"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/attest"
+	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 var (

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mcarey/signet/internal/dialect/vaultkv"
-	"github.com/mcarey/signet/internal/fsm"
-	"github.com/mcarey/signet/internal/kernel"
-	"github.com/mcarey/signet/internal/store"
+	"github.com/mcarey42/signet/internal/dialect/vaultkv"
+	"github.com/mcarey42/signet/internal/fsm"
+	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 const testMount = "secrets-home-solcore-dot-net"
