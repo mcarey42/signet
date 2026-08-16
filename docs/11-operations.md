@@ -77,6 +77,43 @@ wrapper hides them off-box.
   (the diamond-ticket lesson).
 - Prometheus metrics; health endpoints that distinguish "sealed" from "down".
 
+## Open: private keys in the replicated log (raised 2026-08-16)
+
+Today `PutCA` and `PutKey` carry **private key material** through Raft into
+state.db, barrier-encrypted. Public certificates belong there — they are
+domain state, every replica needs them, and they are published anyway. Private
+keys are a different question, and the deciding property is that **the log is
+forever**:
+
+- Rotating a signing key does not unwrite its predecessor. The old key remains
+  in historical log entries, in snapshots, and in every immutable backup
+  generation built from them. A barrier-key compromise at *any future time*
+  therefore exposes *every* signing key the domain has ever held — the exact
+  opposite of what rotation is supposed to buy.
+- This applies equally to the CA intermediate and to the session/role signing
+  keys, which are the golden-ticket keys (E-01 DB-3).
+
+Options, roughly in increasing order of cost:
+
+1. **Status quo** (MVP): barrier-encrypted in the log. Simple, and the key is
+   available wherever leadership lands — which is why it was done this way —
+   but it has the accumulation property above.
+2. **Envelope under a seal-held DEK**: the log holds key ciphertext that the
+   barrier alone cannot open; the DEK is held by the external seal (TPM/KMS).
+   A barrier compromise is then insufficient, and destroying the DEK
+   cryptographically shreds the historical copies. Reuses the per-subtree DEK
+   design already sketched above.
+3. **Reference-only**: the store holds a *handle* (PKCS#11 object, TPM key,
+   KMS key ID); the private key never exists as bytes Signet writes anywhere.
+   RCE then yields key *use during uptime* rather than exfiltration (E-01
+   DB-3's recommended hardening). Cost: signing requires the external device to
+   be reachable, and every node that may become leader needs access.
+
+Leaning 2 as the next step and 3 as the destination, with the `keys.Key` type
+already shaped so the private half can stop being a byte slice without callers
+changing. Decide before multi-node, because adding replicas multiplies the
+number of places a key at rest exists.
+
 ## Open questions
 
 - Audit log: hash-chaining / external anchor for tamper evidence — worth it in v1?
