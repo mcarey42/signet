@@ -87,6 +87,7 @@ func cmdGenesis(args []string) error {
 	cfgPath := fs.String("config", "", "declarative config to load (JSON)")
 	rootPath := fs.String("root-path", "/people/root", "path of the bootstrap admin principal")
 	ttl := fs.Duration("ttl", 12*time.Hour, "root token lifetime")
+	mint := fs.String("mint", "", "comma-separated principal paths to also mint tokens for")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -116,17 +117,25 @@ func cmdGenesis(args []string) error {
 	// The bootstrap admin is the one binding in a domain's life with no
 	// grantor: there is nobody yet who could be one. Apply permits it exactly
 	// once, while the domain holds no bindings at all.
-	rootID, err := k.PutPrincipal(ctx, "", "", *rootPath, "human")
-	if err != nil {
-		return fmt.Errorf("genesis: create root principal: %w", err)
-	}
-	if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {
-		return fmt.Errorf("genesis: bootstrap binding: %w", err)
-	}
-
-	if *cfgPath != "" {
-		if err := loadConfig(ctx, k, rootID, *cfgPath); err != nil {
-			return err
+	//
+	// Re-running genesis over an initialized domain is not an error — it mints
+	// fresh tokens against the existing root. That keeps genesis usable as a
+	// container init step, which re-runs whenever a pod is rescheduled.
+	var rootID op.ID
+	if existing, err := k.PrincipalByPath(ctx, *rootPath); err == nil {
+		rootID = existing.ID
+		fmt.Fprintf(os.Stderr, "genesis: domain already initialized (root %s)\n", rootID)
+	} else {
+		if rootID, err = k.PutPrincipal(ctx, "", "", *rootPath, "human"); err != nil {
+			return fmt.Errorf("genesis: create root principal: %w", err)
+		}
+		if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {
+			return fmt.Errorf("genesis: bootstrap binding: %w", err)
+		}
+		if *cfgPath != "" {
+			if err := loadConfig(ctx, k, rootID, *cfgPath); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -136,6 +145,26 @@ func cmdGenesis(args []string) error {
 	}
 	fmt.Printf("domain initialized\n  root principal: %s (%s)\n  root token: %s\n  expires: %s\n",
 		*rootPath, rootID, token, time.Now().Add(*ttl).Format(time.RFC3339))
+
+	// Bootstrap tokens for declared principals. Tokens are runtime state and
+	// never belong in declarative config, but genesis is the one moment a
+	// domain has no other way to hand out its first credentials — the same
+	// reason it emits a root token at all.
+	for _, path := range strings.Split(*mint, ",") {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		p, err := k.PrincipalByPath(ctx, path)
+		if err != nil {
+			return fmt.Errorf("genesis: mint %s: %w", path, err)
+		}
+		t, _, err := k.CreateSession(ctx, rootID, p.ID, *ttl, []string{"genesis"}, "bootstrap")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("  token %s: %s\n", path, t)
+	}
 	return nil
 }
 

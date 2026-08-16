@@ -1,0 +1,91 @@
+# Signet as a single-node domain in Kubernetes, for the interop test.
+#
+# Genesis runs as an init container: it initializes the domain into the shared
+# volume and prints the bootstrap tokens to its log, which is the only moment a
+# fresh domain can hand out credentials. Re-running it against an initialized
+# domain is safe, so a rescheduled pod recovers rather than crash-looping.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: signet
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signet-genesis
+  namespace: signet
+data:
+  # Desired state only: who exists and what they may do. The workload that ESO
+  # runs as is scoped to one subtree of the secret tree.
+  genesis.json: |
+    {
+      "principals": [
+        {"path": "/clusters/svc/apps/eso", "type": "workload"}
+      ],
+      "bindings": [
+        {"subject": "/clusters/svc/apps/eso",
+         "role": "kv-reader",
+         "scope": "/secrets/cluster-svc"}
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signet
+  namespace: signet
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one voter owns the data directory
+  selector:
+    matchLabels: {app: signet}
+  template:
+    metadata:
+      labels: {app: signet}
+    spec:
+      initContainers:
+        - name: genesis
+          image: signet:dev
+          imagePullPolicy: Never
+          args:
+            - genesis
+            - -data-dir=/data
+            - -config=/config/genesis.json
+            - -mint=/clusters/svc/apps/eso
+            - -ttl=24h
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: config, mountPath: /config}
+      containers:
+        - name: signet
+          image: signet:dev
+          imagePullPolicy: Never
+          args:
+            - serve
+            - -data-dir=/data
+            - -listen=0.0.0.0:8200
+            - -mount=secrets-home-solcore-dot-net
+            - -tree-prefix=/secrets
+          ports:
+            - {name: api, containerPort: 8200}
+          readinessProbe:
+            httpGet: {path: /v1/sys/health, port: api}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - {name: data, mountPath: /data}
+      volumes:
+        - {name: data, emptyDir: {}}
+        - {name: config, configMap: {name: signet-genesis}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signet
+  namespace: signet
+spec:
+  selector: {app: signet}
+  ports:
+    - {name: api, port: 8200, targetPort: api}

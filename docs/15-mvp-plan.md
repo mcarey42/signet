@@ -211,10 +211,35 @@ final one, not a fork.
    standard durable-FSM guard. Now regression-tested across repeated restarts.
    *Determinism and idempotence are separate properties; docs/15 contract 1
    only named the first.*
-2. **ESO-unmodified via token auth** (mid-slice): ESO token auth does **zero**
-   login calls (E-06) — the token goes straight into `X-Vault-Token`. Real ESO
-   in kind reads a real secret with **no attestation code written yet**. Free
-   Tier A surface; every line persists.
+2. ✅ **ESO-unmodified via token auth — DONE (2026-08-16).** Real External
+   Secrets Operator **v2.9.0** (upstream Helm chart, unmodified) in a real kind
+   cluster reads a real secret from Signet — with **no attestation code
+   written**, exactly as E-06 predicted (ESO's token auth makes zero login
+   calls). Signet runs in-cluster from an **11.6 MB scratch image**; genesis
+   runs as an init container and emits bootstrap tokens.
+
+   Four behaviors verified against the real client, using the homelab's own
+   `remoteRef: {key, property}` manifest shape:
+   - **In scope** → `SecretSynced`; the Kubernetes Secret materializes with the
+     right values.
+   - **Out of scope** → refused. ESO reports `Code: 403 … permission denied` —
+     scoped RBAC bounds a real consumer.
+   - **Absent** → refused *differently*: ESO reports its own `"Secret does not
+     exist"`, proving the `404 {"errors":[]}` shape is interpreted as "absent,
+     not an error" rather than as an API failure. The two negative cases being
+     semantically distinct is the real evidence the compat line is right.
+   - **Live rotation** → a write to Signet propagates to the Kubernetes Secret
+     in ~10s; **session revocation** (`revoke-self`) immediately breaks
+     subsequent syncs.
+
+   Captured as `test/kind/run.sh` (one command, idempotent) — the seed of the
+   conformance harness in doc 10 / mission E-10.
+
+   Two reproducibility lessons worth keeping: the domain lives in an emptyDir,
+   so the script replaces the pod to start from a fresh domain (a stale genesis
+   log otherwise yields revoked tokens); and a `SecretStore` **caches its
+   readiness**, so one left over from a previous domain stays NotReady against
+   tokens that no longer exist — the consumer namespace is recreated each run.
 3. **k8s-SA login last**: the JWKS/JWT verifier drops in as the final package;
    the goal line ("via k8s-SA attestation") is crossed when it does.
 
