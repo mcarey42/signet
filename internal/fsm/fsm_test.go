@@ -72,7 +72,7 @@ func TestRestartDoesNotReapplyEntries(t *testing.T) {
 		if err != nil {
 			t.Fatalf("restart %d: session lost: %v", restart, err)
 		}
-		sec, err := k.GetSecret(ctx, s, "/secrets/app")
+		sec, err := k.GetSecret(ctx, s, "/secrets/app", 0)
 		if err != nil {
 			t.Fatalf("restart %d: read: %v", restart, err)
 		}
@@ -128,10 +128,10 @@ func TestScopeSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := k.GetSecret(ctx, esoSess, "/secrets/cluster-svc/apps/litellm"); err != nil {
+	if _, err := k.GetSecret(ctx, esoSess, "/secrets/cluster-svc/apps/litellm", 0); err != nil {
 		t.Errorf("in-scope read failed after restart: %v", err)
 	}
-	if _, err := k.GetSecret(ctx, esoSess, "/secrets/other/thing"); err == nil {
+	if _, err := k.GetSecret(ctx, esoSess, "/secrets/other/thing", 0); err == nil {
 		t.Error("out-of-scope read succeeded after restart")
 	}
 }

@@ -16,18 +16,19 @@ import (
 // always barrier ciphertext.
 const (
 	BucketPrincipals = "principals"
-	BucketPathIndex  = "path_index" // path -> principal ID
-	BucketBindings   = "bindings"   // "<subjectID>/<bindingID>" -> binding
-	BucketSecrets    = "secrets"
-	BucketSessions   = "sessions" // token hash -> session
-	BucketIssuers    = "issuers"  // name -> pinned attestation trust anchor
-	BucketMappings   = "mappings" // name -> evidence->principal rule
-	BucketAudit      = "audit"    // "<term>:<index>:<seq>" -> record
+	BucketPathIndex  = "path_index"  // path -> principal ID
+	BucketBindings   = "bindings"    // "<subjectID>/<bindingID>" -> binding
+	BucketSecretMeta = "secret_meta" // path -> version history + policy
+	BucketSecretData = "secret_data" // "<path>\x00<version>" -> values
+	BucketSessions   = "sessions"    // token hash -> session
+	BucketIssuers    = "issuers"     // name -> pinned attestation trust anchor
+	BucketMappings   = "mappings"    // name -> evidence->principal rule
+	BucketAudit      = "audit"       // "<term>:<index>:<seq>" -> record
 	BucketMeta       = "meta"
 )
 
 var allBuckets = []string{
-	BucketPrincipals, BucketPathIndex, BucketBindings, BucketSecrets,
+	BucketPrincipals, BucketPathIndex, BucketBindings, BucketSecretMeta, BucketSecretData,
 	BucketSessions, BucketIssuers, BucketMappings, BucketAudit, BucketMeta,
 }
 

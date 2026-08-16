@@ -43,6 +43,12 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyPutIssuer(tx, v)
 	case *op.PutMapping:
 		return applyPutMapping(tx, v)
+	case *op.VersionAction:
+		return applyVersionAction(tx, v)
+	case *op.DestroySecret:
+		return applyDestroySecret(tx, v)
+	case *op.PutSecretMeta:
+		return applyPutSecretMeta(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -129,40 +135,6 @@ func applyPutBinding(tx *store.Tx, o *op.PutBinding) op.Result {
 		return op.Result{Err: err}
 	}
 	return op.Result{ID: o.ID}
-}
-
-func applyPutSecret(tx *store.Tx, o *op.PutSecret) op.Result {
-	if err := ValidatePath(o.Path); err != nil {
-		return op.Result{Err: err}
-	}
-	cur := Secret{Path: o.Path, CreatedSec: o.AtSec}
-	raw, ok, err := tx.Get(store.BucketSecrets, o.Path)
-	if err != nil {
-		return op.Result{Err: err}
-	}
-	if ok {
-		if err := json.Unmarshal(raw, &cur); err != nil {
-			return op.Result{Err: err}
-		}
-	}
-	if o.CAS != nil && *o.CAS != cur.Version {
-		return op.Result{Err: errors.New("check-and-set parameter did not match the current version")}
-	}
-
-	next := Secret{
-		Path: o.Path, Data: o.Data,
-		Version:     cur.Version + 1,
-		CreatedSec:  cur.CreatedSec,
-		ModifiedSec: o.AtSec,
-	}
-	blob, err := json.Marshal(next)
-	if err != nil {
-		return op.Result{Err: err}
-	}
-	if err := tx.Put(store.BucketSecrets, o.Path, blob); err != nil {
-		return op.Result{Err: err}
-	}
-	return op.Result{Version: next.Version}
 }
 
 func applyCreateSession(tx *store.Tx, o *op.CreateSession) op.Result {
@@ -345,6 +317,12 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 	case *op.PutBinding:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Scope
 	case *op.PutSecret:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
+	case *op.VersionAction:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
+	case *op.DestroySecret:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
+	case *op.PutSecretMeta:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
 	case *op.CreateSession:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, string(v.Principal)

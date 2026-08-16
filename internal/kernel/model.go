@@ -40,16 +40,44 @@ type Session struct {
 	SenderBindingRef string   `json:"sbk_ref,omitempty"`
 }
 
-// Secret is one KV node. The MVP keeps only the latest value plus a monotonic
-// version counter — the wire envelope is already KV v2-shaped, so version
-// history lands behind an unchanged dialect later (docs/15).
-type Secret struct {
-	Path        string            `json:"path"`
-	Data        map[string]string `json:"data"`
-	Version     uint64            `json:"version"`
-	CreatedSec  int64             `json:"created"`
-	ModifiedSec int64             `json:"modified"`
+// SecretMeta is everything about a secret except its values: the version
+// history, the policy attached to it, and the operator's own labels. Values
+// live separately, one record per version, so reading metadata never decrypts
+// a secret and trimming history is a bounded operation.
+type SecretMeta struct {
+	Path           string                 `json:"path"`
+	CreatedSec     int64                  `json:"created"`
+	UpdatedSec     int64                  `json:"updated"`
+	CurrentVersion uint64                 `json:"current_version"`
+	OldestVersion  uint64                 `json:"oldest_version"`
+	MaxVersions    uint32                 `json:"max_versions"`
+	CASRequired    bool                   `json:"cas_required"`
+	CustomMetadata map[string]string      `json:"custom_metadata,omitempty"`
+	Versions       map[uint64]VersionMeta `json:"versions"`
 }
+
+// VersionMeta records the fate of one version. Deletion is reversible and
+// leaves the data in place; destruction erases it.
+type VersionMeta struct {
+	CreatedSec  int64 `json:"created"`
+	DeletionSec int64 `json:"deletion,omitempty"`
+	Destroyed   bool  `json:"destroyed,omitempty"`
+}
+
+// Readable reports whether a version still yields data.
+func (v VersionMeta) Readable() bool { return v.DeletionSec == 0 && !v.Destroyed }
+
+// Secret is one version's value together with the metadata describing it.
+type Secret struct {
+	Path    string
+	Data    map[string]string
+	Version uint64
+	Meta    VersionMeta
+	All     SecretMeta
+}
+
+// DefaultMaxVersions matches Vault's, so operators carry their intuitions over.
+const DefaultMaxVersions = 10
 
 // Issuer is a pinned attestation trust anchor (docs/04).
 type Issuer struct {

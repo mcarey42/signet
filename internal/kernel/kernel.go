@@ -191,9 +191,10 @@ func (k *Kernel) RevokeSession(ctx context.Context, actor op.ID, token string) e
 
 // --- Secrets --------------------------------------------------------------
 
-// GetSecret authorizes and reads. For online dialects like KV, policy is
-// evaluated per use — fresher than any renewal interval could be.
-func (k *Kernel) GetSecret(ctx context.Context, s Session, path string) (Secret, error) {
+// GetSecret authorizes and reads one version. Version 0 means the current one.
+// For online dialects like KV, policy is evaluated per use — fresher than any
+// renewal interval could be.
+func (k *Kernel) GetSecret(ctx context.Context, s Session, path string, version uint64) (Secret, error) {
 	if err := ValidatePath(path); err != nil {
 		return Secret{}, err
 	}
@@ -206,16 +207,139 @@ func (k *Kernel) GetSecret(ctx context.Context, s Session, path string) (Secret,
 		if !ok {
 			return ErrDenied
 		}
-		raw, found, err := tx.Get(store.BucketSecrets, path)
+		m, found, err := loadSecretMeta(tx, path)
+		if err != nil || !found {
+			if err == nil {
+				err = ErrNotFound
+			}
+			return err
+		}
+		if version == 0 {
+			version = m.CurrentVersion
+		}
+		vm, ok := m.Versions[version]
+		// A deleted or destroyed version reads as absent. Consumers already
+		// treat "no data" and "no secret" identically, so there is no reason to
+		// reproduce Vault's 404-with-a-body quirk.
+		if !ok || !vm.Readable() {
+			return ErrNotFound
+		}
+		raw, found, err := tx.Get(store.BucketSecretData, secretDataKey(path, version))
+		if err != nil || !found {
+			if err == nil {
+				err = ErrNotFound
+			}
+			return err
+		}
+		var data map[string]string
+		if err := json.Unmarshal(raw, &data); err != nil {
+			return err
+		}
+		sec = Secret{Path: path, Data: data, Version: version, Meta: vm, All: m}
+		return nil
+	})
+	return sec, err
+}
+
+// SecretMetadata reads a secret's version history and policy without touching
+// its values.
+func (k *Kernel) SecretMetadata(ctx context.Context, s Session, path string) (SecretMeta, error) {
+	if err := ValidatePath(path); err != nil {
+		return SecretMeta{}, err
+	}
+	var m SecretMeta
+	err := k.store.View(func(tx *store.Tx) error {
+		ok, err := HasAuthority(tx, s.Principal, VerbRead, path, k.now().Unix())
 		if err != nil {
 			return err
 		}
-		if !found {
-			return ErrNotFound
+		if !ok {
+			return ErrDenied
 		}
-		return json.Unmarshal(raw, &sec)
+		var found bool
+		m, found, err = loadSecretMeta(tx, path)
+		if err == nil && !found {
+			err = ErrNotFound
+		}
+		return err
 	})
-	return sec, err
+	return m, err
+}
+
+// ListSecrets returns the immediate children of a prefix.
+//
+// Listing is its own verb: knowing which secrets exist is a disclosure even
+// when their values stay sealed, so a reader of one subtree cannot enumerate
+// another.
+func (k *Kernel) ListSecrets(ctx context.Context, s Session, prefix string) ([]string, error) {
+	if err := ValidatePath(prefix); err != nil {
+		return nil, err
+	}
+	var keys []string
+	err := k.store.View(func(tx *store.Tx) error {
+		ok, err := HasAuthority(tx, s.Principal, VerbList, prefix, k.now().Unix())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrDenied
+		}
+		keys, err = listChildren(tx, prefix)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, ErrNotFound // Vault reports an empty list as absent
+	}
+	return keys, nil
+}
+
+// VersionAction soft-deletes, restores, or destroys versions of a secret.
+func (k *Kernel) VersionAction(ctx context.Context, s Session, path string, versions []uint64, mode op.VersionMode) error {
+	if err := ValidatePath(path); err != nil {
+		return err
+	}
+	// Destroying data is not the same authority as replacing it.
+	verb := VerbWrite
+	if mode == op.VersionDestroy {
+		verb = VerbDelete
+	}
+	if err := k.authorize(s, verb, path); err != nil {
+		return err
+	}
+	_, err := k.prop.Propose(ctx, &op.VersionAction{
+		Header: k.header(s.Principal), Path: path, Versions: versions, Mode: mode,
+	})
+	return err
+}
+
+// DestroySecret removes a secret and its whole history.
+func (k *Kernel) DestroySecret(ctx context.Context, s Session, path string) error {
+	if err := ValidatePath(path); err != nil {
+		return err
+	}
+	if err := k.authorize(s, VerbDelete, path); err != nil {
+		return err
+	}
+	_, err := k.prop.Propose(ctx, &op.DestroySecret{Header: k.header(s.Principal), Path: path})
+	return err
+}
+
+// PutSecretMetadata writes the policy attached to a secret.
+func (k *Kernel) PutSecretMetadata(ctx context.Context, s Session, path string, custom map[string]string, maxVersions uint32, casRequired bool) error {
+	if err := ValidatePath(path); err != nil {
+		return err
+	}
+	if err := k.authorize(s, VerbWrite, path); err != nil {
+		return err
+	}
+	_, err := k.prop.Propose(ctx, &op.PutSecretMeta{
+		Header: k.header(s.Principal), Path: path,
+		CustomMetadata: custom, MaxVersions: maxVersions, CASRequired: casRequired,
+	})
+	return err
 }
 
 // PutSecret authorizes, then proposes. The CAS check itself runs inside Apply,

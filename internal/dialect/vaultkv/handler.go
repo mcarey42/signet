@@ -13,11 +13,14 @@ package vaultkv
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mcarey/signet/internal/kernel"
+	"github.com/mcarey/signet/internal/op"
 )
 
 // Status is the server-side view sys/health reports. Sealing and consensus are
@@ -66,10 +69,29 @@ func (h *Handler) Routes() *http.ServeMux {
 	// would match /v1/auth/data/login — and since a server serves the mounts it
 	// was configured with, naming them is also more honest: an unknown mount is
 	// a routing miss, not a permission question.
-	data := "/v1/" + h.cfg.Mount + "/data/{path...}"
-	mux.HandleFunc("GET "+data, h.readSecret)
-	mux.HandleFunc("PUT "+data, h.writeSecret)
-	mux.HandleFunc("POST "+data, h.writeSecret)
+	m := "/v1/" + h.cfg.Mount
+	mux.HandleFunc("GET "+m+"/data/{path...}", h.readSecret)
+	mux.HandleFunc("PUT "+m+"/data/{path...}", h.writeSecret)
+	mux.HandleFunc("POST "+m+"/data/{path...}", h.writeSecret)
+	mux.HandleFunc("DELETE "+m+"/data/{path...}", h.deleteLatest)
+
+	// Metadata carries the version history and the policy attached to a path.
+	// A LIST is a GET with ?list=true here: every Go client and both CLIs
+	// rewrite the LIST verb that way, so routing on the verb alone would miss
+	// nearly every real caller (E-06).
+	mux.HandleFunc("GET "+m+"/metadata/{path...}", h.metadata)
+	mux.HandleFunc("LIST "+m+"/metadata/{path...}", h.listSecrets)
+	mux.HandleFunc("PUT "+m+"/metadata/{path...}", h.writeMetadata)
+	mux.HandleFunc("POST "+m+"/metadata/{path...}", h.writeMetadata)
+	mux.HandleFunc("DELETE "+m+"/metadata/{path...}", h.destroySecret)
+
+	// Version-level operations.
+	mux.HandleFunc("PUT "+m+"/delete/{path...}", h.versionAction(op.VersionDelete))
+	mux.HandleFunc("POST "+m+"/delete/{path...}", h.versionAction(op.VersionDelete))
+	mux.HandleFunc("PUT "+m+"/undelete/{path...}", h.versionAction(op.VersionUndelete))
+	mux.HandleFunc("POST "+m+"/undelete/{path...}", h.versionAction(op.VersionUndelete))
+	mux.HandleFunc("PUT "+m+"/destroy/{path...}", h.versionAction(op.VersionDestroy))
+	mux.HandleFunc("POST "+m+"/destroy/{path...}", h.versionAction(op.VersionDestroy))
 
 	mux.HandleFunc("/", h.notFound)
 	return mux
@@ -227,7 +249,14 @@ func (h *Handler) readSecret(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no handler for route")
 		return
 	}
-	sec, err := h.k.GetSecret(r.Context(), s, path)
+	var version uint64
+	if v := r.URL.Query().Get("version"); v != "" {
+		if version, err = strconv.ParseUint(v, 10, 64); err != nil {
+			writeErr(w, http.StatusBadRequest, "version must be a number")
+			return
+		}
+	}
+	sec, err := h.k.GetSecret(r.Context(), s, path, version)
 	switch {
 	case errors.Is(err, kernel.ErrNotFound):
 		// A missing secret is 404 with an EMPTY errors array — that exact shape
@@ -245,13 +274,224 @@ func (h *Handler) readSecret(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope(map[string]any{
 		"data": sec.Data,
 		"metadata": map[string]any{
-			"created_time":    time.Unix(sec.CreatedSec, 0).UTC().Format(time.RFC3339),
-			"custom_metadata": nil,
-			"deletion_time":   "",
-			"destroyed":       false,
+			"created_time":    rfc3339(sec.Meta.CreatedSec),
+			"custom_metadata": nilIfEmpty(sec.All.CustomMetadata),
+			"deletion_time":   rfc3339(sec.Meta.DeletionSec),
+			"destroyed":       sec.Meta.Destroyed,
 			"version":         sec.Version,
 		},
 	}))
+}
+
+// metadata serves both the metadata read and — because every Go client and CLI
+// rewrites LIST as GET with ?list=true — the list.
+func (h *Handler) metadata(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("list") == "true" {
+		h.listSecrets(w, r)
+		return
+	}
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	path, ok := h.treePath(r)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no handler for route")
+		return
+	}
+	m, err := h.k.SecretMetadata(r.Context(), s, path)
+	if h.writeKernelErr(w, err) {
+		return
+	}
+	versions := map[string]any{}
+	for v, vm := range m.Versions {
+		versions[strconv.FormatUint(v, 10)] = map[string]any{
+			"created_time":  rfc3339(vm.CreatedSec),
+			"deletion_time": rfc3339(vm.DeletionSec),
+			"destroyed":     vm.Destroyed,
+		}
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{
+		"created_time":         rfc3339(m.CreatedSec),
+		"updated_time":         rfc3339(m.UpdatedSec),
+		"current_version":      m.CurrentVersion,
+		"oldest_version":       m.OldestVersion,
+		"max_versions":         m.MaxVersions,
+		"cas_required":         m.CASRequired,
+		"delete_version_after": "0s",
+		"custom_metadata":      nilIfEmpty(m.CustomMetadata),
+		"versions":             versions,
+	}))
+}
+
+func (h *Handler) listSecrets(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	path, ok := h.treePath(r)
+	if !ok {
+		// Listing the mount root is legitimate; treePath rejects an empty path
+		// because a secret needs a name, so handle the root explicitly.
+		path = h.cfg.TreePrefix
+	}
+	keys, err := h.k.ListSecrets(r.Context(), s, path)
+	if h.writeKernelErr(w, err) {
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"keys": keys}))
+}
+
+func (h *Handler) writeMetadata(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	path, ok := h.treePath(r)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no handler for route")
+		return
+	}
+	var body struct {
+		CustomMetadata map[string]string `json:"custom_metadata"`
+		MaxVersions    uint32            `json:"max_versions"`
+		CASRequired    bool              `json:"cas_required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	if h.writeKernelErr(w, h.k.PutSecretMetadata(r.Context(), s, path, body.CustomMetadata, body.MaxVersions, body.CASRequired)) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// deleteLatest is the soft delete DELETE on the data path: reversible, and the
+// most common destructive action, so it is deliberately the least destructive.
+func (h *Handler) deleteLatest(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	path, ok := h.treePath(r)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no handler for route")
+		return
+	}
+	if h.writeKernelErr(w, h.k.VersionAction(r.Context(), s, path, nil, op.VersionDelete)) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) versionAction(mode op.VersionMode) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s, err := h.session(r)
+		if err != nil {
+			writeErr(w, http.StatusForbidden, "permission denied")
+			return
+		}
+		path, ok := h.treePath(r)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "no handler for route")
+			return
+		}
+		var body struct {
+			Versions versionList `json:"versions"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body) // an empty body means "the current version"
+		if h.writeKernelErr(w, h.k.VersionAction(r.Context(), s, path, body.Versions, mode)) {
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (h *Handler) destroySecret(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	path, ok := h.treePath(r)
+	if !ok {
+		writeErr(w, http.StatusNotFound, "no handler for route")
+		return
+	}
+	if h.writeKernelErr(w, h.k.DestroySecret(r.Context(), s, path)) {
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeKernelErr maps kernel errors onto the status codes clients branch on,
+// and reports whether it handled the request.
+func (h *Handler) writeKernelErr(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, kernel.ErrNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]any{"errors": []string{}})
+	case errors.Is(err, kernel.ErrDenied):
+		writeErr(w, http.StatusForbidden, "permission denied")
+	default:
+		writeErr(w, http.StatusBadRequest, err.Error())
+	}
+	return true
+}
+
+// versionList accepts version numbers as JSON numbers or as strings.
+//
+// The vault/bao CLI sends them as strings ("versions":["1"]) while the HTTP API
+// documents numbers, and both appear in the wild. Decoding strictly into
+// []uint64 is worse than it looks: Go's decoder reports the type error but has
+// already appended a zero, so a request to undelete version 1 silently becomes
+// a request to act on version 0, which matches nothing and does nothing. A
+// destructive call that quietly no-ops is the worst possible failure here, so
+// this type accepts both forms and rejects anything else outright.
+type versionList []uint64
+
+func (v *versionList) UnmarshalJSON(b []byte) error {
+	var raw []any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	out := make(versionList, 0, len(raw))
+	for _, item := range raw {
+		switch n := item.(type) {
+		case float64:
+			out = append(out, uint64(n))
+		case string:
+			parsed, err := strconv.ParseUint(n, 10, 64)
+			if err != nil {
+				return fmt.Errorf("version %q is not a number", n)
+			}
+			out = append(out, parsed)
+		default:
+			return fmt.Errorf("version %v is neither a number nor a string", item)
+		}
+	}
+	*v = out
+	return nil
+}
+
+func rfc3339(sec int64) string {
+	if sec == 0 {
+		return ""
+	}
+	return time.Unix(sec, 0).UTC().Format(time.RFC3339)
+}
+
+func nilIfEmpty(m map[string]string) any {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 func (h *Handler) writeSecret(w http.ResponseWriter, r *http.Request) {

@@ -35,6 +35,9 @@ const (
 	KindRevokeSession Kind = 5
 	KindPutIssuer     Kind = 6
 	KindPutMapping    Kind = 7
+	KindVersionAction Kind = 8
+	KindDestroySecret Kind = 9
+	KindPutSecretMeta Kind = 10
 )
 
 func (k Kind) String() string {
@@ -53,6 +56,12 @@ func (k Kind) String() string {
 		return "PutIssuer"
 	case KindPutMapping:
 		return "PutMapping"
+	case KindVersionAction:
+		return "VersionAction"
+	case KindDestroySecret:
+		return "DestroySecret"
+	case KindPutSecretMeta:
+		return "PutSecretMeta"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -119,6 +128,42 @@ type RevokeSession struct {
 	TokenHash string `json:"token_hash"`
 }
 
+// VersionMode selects what a VersionAction does to the versions it names.
+type VersionMode string
+
+const (
+	// VersionDelete is reversible: the data stays, marked deleted.
+	VersionDelete VersionMode = "delete"
+	// VersionUndelete restores a soft-deleted version.
+	VersionUndelete VersionMode = "undelete"
+	// VersionDestroy erases the data and cannot be undone.
+	VersionDestroy VersionMode = "destroy"
+)
+
+// VersionAction soft-deletes, restores, or destroys specific versions of a
+// secret. An empty Versions list means the current version.
+type VersionAction struct {
+	Header
+	Path     string      `json:"path"`
+	Versions []uint64    `json:"versions,omitempty"`
+	Mode     VersionMode `json:"mode"`
+}
+
+// DestroySecret removes a secret entirely: metadata and every version.
+type DestroySecret struct {
+	Header
+	Path string `json:"path"`
+}
+
+// PutSecretMeta writes the policy attached to a secret rather than its value.
+type PutSecretMeta struct {
+	Header
+	Path           string            `json:"path"`
+	CustomMetadata map[string]string `json:"custom_metadata,omitempty"`
+	MaxVersions    uint32            `json:"max_versions,omitempty"`
+	CASRequired    bool              `json:"cas_required,omitempty"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -158,6 +203,9 @@ func (PutSecret) OpKind() Kind     { return KindPutSecret }
 func (CreateSession) OpKind() Kind { return KindCreateSession }
 func (RevokeSession) OpKind() Kind { return KindRevokeSession }
 func (PutIssuer) OpKind() Kind     { return KindPutIssuer }
+func (VersionAction) OpKind() Kind { return KindVersionAction }
+func (DestroySecret) OpKind() Kind { return KindDestroySecret }
+func (PutSecretMeta) OpKind() Kind { return KindPutSecretMeta }
 func (PutMapping) OpKind() Kind    { return KindPutMapping }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
@@ -220,6 +268,15 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindPutMapping:
 		var v PutMapping
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindVersionAction:
+		var v VersionAction
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindDestroySecret:
+		var v DestroySecret
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutSecretMeta:
+		var v PutSecretMeta
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

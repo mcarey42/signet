@@ -244,3 +244,36 @@ func TestAuthFailures(t *testing.T) {
 		t.Errorf("wrong mount: status = %d, want 404", code)
 	}
 }
+
+// The vault/bao CLI sends version numbers as JSON strings while the HTTP API
+// documents numbers. Both must work, and — more importantly — a form that is
+// neither must be rejected rather than silently acted on. Decoding strictly
+// into []uint64 appends a zero on a type error, which turned "undelete version
+// 1" into a no-op that still reported success.
+func TestVersionActionAcceptsStringAndNumericVersions(t *testing.T) {
+	srv, token := newServer(t)
+	mount := "/v1/" + testMount
+
+	for _, c := range []struct{ slug, name, body string }{
+		{"numeric", "numeric versions", `{"versions":[1]}`},
+		{"stringy", "string versions (what the CLI sends)", `{"versions":["1"]}`},
+	} {
+		path := mount + "/data/versions-" + c.slug
+		if code, b := do(t, srv, "PUT", path, token, []byte(`{"data":{"k":"v"}}`)); code != 200 {
+			t.Fatalf("%s: seed write: %d %s", c.name, code, b)
+		}
+		if code, b := do(t, srv, "DELETE", path, token, nil); code != 204 {
+			t.Fatalf("%s: delete: %d %s", c.name, code, b)
+		}
+		if code, b := do(t, srv, "GET", path, token, nil); code != 404 {
+			t.Fatalf("%s: deleted secret still readable: %d %s", c.name, code, b)
+		}
+		undelete := strings.Replace(path, "/data/", "/undelete/", 1)
+		if code, b := do(t, srv, "PUT", undelete, token, []byte(c.body)); code != 204 {
+			t.Fatalf("%s: undelete: %d %s", c.name, code, b)
+		}
+		if code, b := do(t, srv, "GET", path, token, nil); code != 200 {
+			t.Errorf("%s: undelete reported success but the value did not come back: %d %s", c.name, code, b)
+		}
+	}
+}
