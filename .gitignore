@@ -1,0 +1,7 @@
+# macOS AppleDouble files (NFS)
+._*
+.DS_Store
+
+# local scratch
+*.local.md
+/tmp/
