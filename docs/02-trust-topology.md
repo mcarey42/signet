@@ -161,6 +161,38 @@ this. Therefore:
   cost of offline/partition-tolerant parent re-issue. A deliberate trade for a
   genuinely adversarial parent.
 
+## Crypto-agility: PQC-hedged composite roots (Decided)
+
+The trust anchor is **crypto-agile from day one** so an algorithm can be
+retired without re-bootstrapping trust — aligned with catalyst / composite
+certificate prior art (ITU-T X.509 `SubjectAltPublicKeyInfo`/`AltSignatureValue`;
+IETF LAMPS composite signatures for PQC migration).
+
+- **Roots/intermediates are AND-composite**: multiple algorithms
+  (RSA + EC + PQC, e.g. ML-DSA) carried on one anchor, all verified. Forging
+  the CA's authenticity then requires breaking **every** live algorithm at
+  once — maximal hedge. Composite cost (bigger, 3× signing, still-stabilizing
+  ASN.1) is paid on the few, long-lived anchors where it's worth it.
+- **Leaves stay single-strong-algorithm and agile by rotation** — a
+  ~15-min leaf gets its agility for free by rotating to a new algorithm on its
+  next renewal; it need not carry three signatures.
+- **"Which algorithms are currently acceptable" lives in the signed,
+  monotonically-versioned trust bundle — NOT in mutable cert flags.** A signed
+  cert is immutable; flags baked into it can't be changed without re-signing
+  (= a new cert). So the algorithm-policy object rides the FED-1 bundle-epoch
+  machinery: retiring RSA = publish epoch N+1 dropping it, propagated via the
+  refresh path clients already run; surviving algorithms stay pinned, trust is
+  never rebuilt from zero. Adding a new algorithm is likewise a bundle epoch.
+- **The policy object is AND-signed by all currently-live algorithms** — an
+  attacker who breaks one algorithm still can't forge the policy statement
+  (this is the "cross-sign the flags, agreement as resilience" idea, relocated
+  from the cert to the bundle).
+- **Downgrade protection**: the policy states the minimum required strength;
+  a verifier refuses a cert lacking a currently-required signature even if a
+  weaker one validates (the algorithm analogue of TLS downgrade defense). OR-
+  style "verify the strongest you support" is used only for migration
+  compatibility, always under this floor.
+
 ## Federation between equals (Draft)
 
 Peering (two sovereign orgs, or two roots in one org) does **not** require a

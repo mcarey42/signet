@@ -76,9 +76,27 @@ Litestream-shaped **generations** over Raft-entry WAL shipping:
   credentials they cover expire; restore is a privileged audited ceremony (11)
   that replays post-snapshot revocations and alerts on epoch regression.
 - **Clock skew** [TIME-1]: TTLs are leader-clock-relative; state the tolerated
-  issuance↔verification skew budget (±N min, reject outside) — a
+  issuance↔verification skew budget (start ±30s, reject outside) — a
   clock-controlled RP otherwise unbounds the revocation window; crown jewels
   use tier-3 online (clock-independent).
+
+## Time (Decided)
+
+**NTP (or equivalent) is a hard dependency** — every credential system needs
+rough time agreement (Kerberos has required <5min skew for decades). The
+"delta since issuance" idea was rejected: it still needs a reference for "now,"
+and a fast clock still mis-expires credentials; monotonic clocks measure
+durations on one machine but give no cross-machine agreement, which is what TTL
+validation requires. Requirements: NTP required; defined skew budget; signed
+issuance timestamps; agents refuse to present creds their own trusted clock
+says are expired; crown jewels on tier-3 (clock-independent).
+
+**Signed time-beacon (cheap double-verify):** Signet nodes emit a signed
+"current time" in responses so a skewed client can **detect** drift/tampering
+(not *trust* it as sole source — a rogue server could lie, so NTP stays
+primary). The sound "get fancy" option is **Roughtime** (authenticated time
+with cross-server lie-detection) — a later enhancement, same detect-don't-
+solely-trust posture.
 
 ## Remaining open (implementation-stage)
 
