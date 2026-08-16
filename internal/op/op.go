@@ -41,6 +41,9 @@ const (
 	KindPutCA         Kind = 11
 	KindPutPKIRole    Kind = 12
 	KindRecordIssue   Kind = 13
+	KindPutRolePolicy Kind = 14
+	KindPutKey        Kind = 15
+	KindPutSSHRole    Kind = 16
 )
 
 func (k Kind) String() string {
@@ -71,6 +74,12 @@ func (k Kind) String() string {
 		return "PutPKIRole"
 	case KindRecordIssue:
 		return "RecordIssuance"
+	case KindPutRolePolicy:
+		return "PutRolePolicy"
+	case KindPutKey:
+		return "PutKey"
+	case KindPutSSHRole:
+		return "PutSSHRole"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -205,6 +214,37 @@ type RecordIssuance struct {
 	Requester ID       `json:"requester"`
 }
 
+// PutRolePolicy sets a role's security floor — the freshness tier and any
+// requirement on how strongly the session must have been established. It lives
+// on the role rather than on bindings so a second, weaker binding cannot
+// downgrade it (E-13 F3).
+type PutRolePolicy struct {
+	Header
+	Role    string `json:"role"`
+	Policy  []byte `json:"policy"`
+	Grantor ID     `json:"grantor"`
+}
+
+// PutKey installs a signing key. Keys are separated by purpose and rotated
+// independently; retired keys stay stored so credentials already issued keep
+// verifying until they expire.
+type PutKey struct {
+	Header
+	ID      string `json:"id"`
+	Purpose string `json:"purpose"`
+	Key     []byte `json:"key"`
+	Active  bool   `json:"active"`
+	Grantor ID     `json:"grantor"`
+}
+
+// PutSSHRole defines which SSH principals a role may assert.
+type PutSSHRole struct {
+	Header
+	Name    string `json:"name"`
+	Role    []byte `json:"role"`
+	Grantor ID     `json:"grantor"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -251,6 +291,9 @@ func (PutMapping) OpKind() Kind     { return KindPutMapping }
 func (PutCA) OpKind() Kind          { return KindPutCA }
 func (PutPKIRole) OpKind() Kind     { return KindPutPKIRole }
 func (RecordIssuance) OpKind() Kind { return KindRecordIssue }
+func (PutRolePolicy) OpKind() Kind  { return KindPutRolePolicy }
+func (PutKey) OpKind() Kind         { return KindPutKey }
+func (PutSSHRole) OpKind() Kind     { return KindPutSSHRole }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -330,6 +373,15 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindRecordIssue:
 		var v RecordIssuance
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutRolePolicy:
+		var v PutRolePolicy
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutKey:
+		var v PutKey
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutSSHRole:
+		var v PutSSHRole
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

@@ -27,13 +27,17 @@ const (
 	BucketCA         = "ca"          // name -> CA material
 	BucketPKIRoles   = "pki_roles"   // name -> signing role
 	BucketIssuance   = "issuance"    // serial -> issuance record
+	BucketRolePolicy = "role_policy" // role -> security floor
+	BucketKeys       = "keys"        // "<purpose>/<kid>" -> signing key
+	BucketSSHRoles   = "ssh_roles"   // name -> ssh signing role
 	BucketMeta       = "meta"
 )
 
 var allBuckets = []string{
 	BucketPrincipals, BucketPathIndex, BucketBindings, BucketSecretMeta, BucketSecretData,
 	BucketSessions, BucketIssuers, BucketMappings,
-	BucketCA, BucketPKIRoles, BucketIssuance, BucketAudit, BucketMeta,
+	BucketCA, BucketPKIRoles, BucketIssuance,
+	BucketRolePolicy, BucketKeys, BucketSSHRoles, BucketAudit, BucketMeta,
 }
 
 var ErrReadOnly = errors.New("store: write attempted in a read-only transaction")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/mcarey42/signet/internal/ca"
@@ -232,6 +233,89 @@ func (k *Kernel) IssuanceLog(ctx context.Context, s Session) ([]IssuanceRecord, 
 
 // GenesisCA runs a root ceremony. The root private key is returned to the
 // caller and never stored.
-func GenesisCA(commonName string, permittedDNS []string, rootTTL, interTTL time.Duration) (*ca.GenesisResult, error) {
-	return ca.Genesis(commonName, permittedDNS, rootTTL, interTTL, time.Now())
+func GenesisCA(commonName string, permittedDNS []string, permittedIPs []*net.IPNet, rootTTL, interTTL time.Duration) (*ca.GenesisResult, error) {
+	return ca.Genesis(commonName, permittedDNS, permittedIPs, rootTTL, interTTL, time.Now())
+}
+
+// --- SSH roles ------------------------------------------------------------
+
+// sshRole mirrors the SSH dialect's Role. The kernel cannot import the dialect
+// — dialects import the kernel, never the reverse (charter principle 5) — so
+// the shared shape is declared here and the dialect decodes into its own type.
+type sshRole = SSHRoleSpec
+
+// SSHRoleSpec bounds what an SSH signing role may assert.
+type SSHRoleSpec struct {
+	Name                string              `json:"name"`
+	Scope               string              `json:"scope"`
+	AllowedPrincipals   []string            `json:"allowed_principals"`
+	PrincipalsFromRoles map[string][]string `json:"principals_from_roles,omitempty"`
+	MaxTTLSec           int64               `json:"max_ttl_sec"`
+	AllowAgentForward   bool                `json:"allow_agent_forwarding,omitempty"`
+	AllowPortForward    bool                `json:"allow_port_forwarding,omitempty"`
+	AllowPTY            bool                `json:"allow_pty,omitempty"`
+}
+
+// SSHRole loads a signing role for the SSH dialect. It is stored alongside the
+// X.509 roles because both answer the same question: what may this role mint?
+func (k *Kernel) SSHRole(ctx context.Context, name string) (sshRole, error) {
+	var r sshRole
+	err := k.store.View(func(tx *store.Tx) error {
+		raw, ok, err := tx.Get(store.BucketSSHRoles, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w: ssh role %q", ErrNotFound, name)
+		}
+		return json.Unmarshal(raw, &r)
+	})
+	return r, err
+}
+
+// PutSSHRole defines an SSH signing role.
+func (k *Kernel) PutSSHRole(ctx context.Context, grantor op.ID, name string, role any) error {
+	blob, err := json.Marshal(role)
+	if err != nil {
+		return err
+	}
+	_, err = k.prop.Propose(ctx, &op.PutSSHRole{Header: k.header(grantor), Name: name, Role: blob, Grantor: grantor})
+	return err
+}
+
+// AuthorizeSign checks signing authority at a scope, for dialects that need to
+// refuse before doing expensive work.
+func (k *Kernel) AuthorizeSign(ctx context.Context, s Session, scope string) error {
+	return k.authorize(s, VerbSign, scope)
+}
+
+func applyPutSSHRole(tx *store.Tx, o *op.PutSSHRole) op.Result {
+	if o.Name == "" {
+		return op.Result{Err: errors.New("ssh role: missing name")}
+	}
+	var probe struct {
+		Scope             string   `json:"scope"`
+		AllowedPrincipals []string `json:"allowed_principals"`
+	}
+	if err := json.Unmarshal(o.Role, &probe); err != nil {
+		return op.Result{Err: fmt.Errorf("ssh role: %w", err)}
+	}
+	if err := ValidatePath(probe.Scope); err != nil {
+		return op.Result{Err: fmt.Errorf("ssh role scope: %w", err)}
+	}
+	// Defining who may log in as whom is a grant, so it narrows like one.
+	if o.Grantor == "" {
+		return op.Result{Err: errors.New("ssh role: missing grantor")}
+	}
+	ok, err := HasAuthority(tx, o.Grantor, VerbAdmin, probe.Scope, o.AtSec)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if !ok {
+		return op.Result{Err: fmt.Errorf("ssh role: grantor %s lacks admin authority at %s", o.Grantor, probe.Scope)}
+	}
+	if err := tx.Put(store.BucketSSHRoles, o.Name, o.Role); err != nil {
+		return op.Result{Err: err}
+	}
+	return op.Result{}
 }

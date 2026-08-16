@@ -16,7 +16,7 @@ import (
 
 func testCA(t *testing.T) *CA {
 	t.Helper()
-	res, err := Genesis("Test", []string{"example.com"}, 10*365*24*time.Hour, 365*24*time.Hour, time.Now())
+	res, err := Genesis("Test", []string{"example.com"}, nil, 10*365*24*time.Hour, 365*24*time.Hour, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

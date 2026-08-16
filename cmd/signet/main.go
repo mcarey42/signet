@@ -9,11 +9,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,9 +28,12 @@ import (
 	"time"
 
 	"github.com/mcarey42/signet/internal/ca"
+	"github.com/mcarey42/signet/internal/dialect/oidc"
+	"github.com/mcarey42/signet/internal/dialect/sshca"
 	"github.com/mcarey42/signet/internal/dialect/vaultkv"
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/keys"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/store"
 )
@@ -107,6 +117,23 @@ type GenesisConfig struct {
 		AllowIPSANs      bool     `json:"allow_ip_sans"`
 		MaxTTLSeconds    int64    `json:"max_ttl_seconds"`
 	} `json:"pki_roles"`
+	SSHRoles []struct {
+		Name                string              `json:"name"`
+		Scope               string              `json:"scope"`
+		AllowedPrincipals   []string            `json:"allowed_principals"`
+		PrincipalsFromRoles map[string][]string `json:"principals_from_roles"`
+		MaxTTLSec           int64               `json:"max_ttl_sec"`
+		AllowPTY            bool                `json:"allow_pty"`
+	} `json:"ssh_roles"`
+	// RolePolicies carry each role's security floor — the freshness tier and
+	// any requirement on how strongly the session was established.
+	RolePolicies []struct {
+		Role        string `json:"role"`
+		MinTier     int    `json:"min_tier"`
+		RequiredAMR string `json:"required_amr"`
+		MaxTTLSec   int64  `json:"max_ttl_sec"`
+		OwnerScope  string `json:"owner_scope"`
+	} `json:"role_policies"`
 }
 
 func cmdGenesis(args []string) error {
@@ -119,7 +146,10 @@ func cmdGenesis(args []string) error {
 	mint := fs.String("mint", "", "comma-separated principal paths to also mint tokens for")
 	caCN := fs.String("ca-common-name", "", "create a certificate authority with this name (skipped if empty)")
 	caDomains := fs.String("ca-domains", "", "comma-separated DNS domains the CA may issue for")
+	caIPRanges := fs.String("ca-ip-ranges", "", "comma-separated CIDRs the CA may issue IP SANs for (default: none, and IP SANs are excluded outright)")
 	rootKeyOut := fs.String("root-key-out", "", "where to write the root private key (default DATA-DIR/../root-ca.key)")
+	serveCertOut := fs.String("server-cert-out", "", "directory to write this server's own TLS material (tls.crt, tls.key, ca.crt)")
+	serverNames := fs.String("server-names", "", "comma-separated DNS names and IPs for that certificate")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -172,7 +202,29 @@ func cmdGenesis(args []string) error {
 	}
 
 	if *caCN != "" {
-		if err := genesisCA(ctx, k, rootID, *caCN, *caDomains, caKeyPath(*dataDir, *rootKeyOut)); err != nil {
+		if err := genesisCA(ctx, k, rootID, *caCN, *caDomains, *caIPRanges, caKeyPath(*dataDir, *rootKeyOut)); err != nil {
+			return err
+		}
+	}
+	// Signing keys for the offline dialects. Separate per purpose so one stolen
+	// key is not all of them, and generated here so a domain can mint
+	// credentials the moment it exists.
+	for _, purpose := range []keys.Purpose{keys.PurposeToken, keys.PurposeSSH} {
+		if _, err := k.ActiveKey(ctx, purpose); err == nil {
+			continue // already present; rotation is a separate, deliberate act
+		}
+		key, err := keys.Generate(purpose, time.Now().Unix())
+		if err != nil {
+			return fmt.Errorf("genesis: %s key: %w", purpose, err)
+		}
+		if err := k.InstallKey(ctx, rootID, key, true); err != nil {
+			return fmt.Errorf("genesis: install %s key: %w", purpose, err)
+		}
+		fmt.Fprintf(os.Stderr, "  %s signing key %s\n", purpose, key.ID)
+	}
+
+	if *serveCertOut != "" {
+		if err := genesisServerCert(ctx, k, rootID, *serveCertOut, splitList(*serverNames)); err != nil {
 			return err
 		}
 	}
@@ -213,7 +265,7 @@ func cmdGenesis(args []string) error {
 // stored. Everything written to the FSM lands in the Raft log and in every
 // backup generation built from it, so a root key that touched state would make
 // "the root is offline" false forever after (docs/14, E-13 F6).
-func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, domains, rootKeyPath string) error {
+func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, domains, ipRanges, rootKeyPath string) error {
 	// Idempotent like the rest of genesis: a domain that already has an
 	// authority keeps it. Minting a second root would orphan every certificate
 	// issued under the first.
@@ -230,7 +282,15 @@ func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, d
 		}
 	}
 	permitted := splitList(domains)
-	res, err := kernel.GenesisCA(commonName, permitted, 10*365*24*time.Hour, 365*24*time.Hour)
+	var nets []*net.IPNet
+	for _, cidr := range splitList(ipRanges) {
+		_, n, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("genesis: -ca-ip-ranges %q: %w", cidr, err)
+		}
+		nets = append(nets, n)
+	}
+	res, err := kernel.GenesisCA(commonName, permitted, nets, 10*365*24*time.Hour, 365*24*time.Hour)
 	if err != nil {
 		return err
 	}
@@ -245,6 +305,86 @@ func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, d
 	fmt.Fprintf(os.Stderr, "  CA %q created for %v\n", commonName, permitted)
 	fmt.Fprintf(os.Stderr, "  ROOT KEY WRITTEN TO %s — move it offline and delete this copy.\n", rootKeyPath)
 	fmt.Fprintf(os.Stderr, "  It is not in the store, the log, or any backup; this file is the only copy.\n")
+	return nil
+}
+
+// genesisServerCert issues the certificate Signet itself serves with, from the
+// authority it just created.
+//
+// This resolves a real chicken-and-egg: a Kubernetes API server will only fetch
+// OIDC discovery over HTTPS, and the CA that could issue that certificate is
+// the one being created here. Doing it in the ceremony means a domain comes up
+// able to serve TLS with its own trust chain and nothing borrowed.
+func genesisServerCert(ctx context.Context, k *kernel.Kernel, actor op.ID, dir string, names []string) error {
+	if len(names) == 0 {
+		return errors.New("genesis: -server-cert-out needs -server-names")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	var dns []string
+	var ips []net.IP
+	for _, n := range names {
+		if ip := net.ParseIP(n); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		dns = append(dns, n)
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: names[0]}, DNSNames: dns, IPAddresses: ips,
+	}, key)
+	if err != nil {
+		return err
+	}
+	// The server's certificate is issued through the same path as everyone
+	// else's — role checks, verification gate, issuance log — using a
+	// self-scoped role created for the purpose.
+	if err := k.PutPKIRole(ctx, actor, ca.Role{
+		Name: "signet-server", Scope: "/pki/server",
+		AllowedDomains: dns, AllowSubdomains: true, AllowBareDomains: true,
+		AllowIPSANs: len(ips) > 0, MaxTTLSeconds: int64((365 * 24 * time.Hour).Seconds()),
+	}); err != nil {
+		return err
+	}
+	_, sess, err := k.CreateSession(ctx, actor, actor, time.Minute, []string{"genesis"}, "bootstrap")
+	if err != nil {
+		return err
+	}
+	issued, err := k.SignCertificate(ctx, sess, "default", "signet-server", ca.Request{
+		CSRPEM:     pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER}),
+		CommonName: names[0], DNSNames: dns, TTL: 365 * 24 * time.Hour,
+	})
+	if err != nil {
+		return fmt.Errorf("genesis: server certificate: %w", err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	root, chain, err := k.CAChain(ctx, "default")
+	if err != nil {
+		return err
+	}
+	for name, content := range map[string][]byte{
+		"tls.crt":   append(append([]byte{}, issued.CertPEM...), issued.IssuingCAPEM...),
+		"tls.key":   pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
+		"ca.crt":    root,
+		"chain.pem": chain,
+	} {
+		mode := os.FileMode(0o644)
+		if name == "tls.key" {
+			mode = 0o600
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), content, mode); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(os.Stderr, "  server certificate for %v written to %s\n", names, dir)
 	return nil
 }
 
@@ -325,6 +465,25 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 		}
 		fmt.Fprintf(os.Stderr, "  pki role %s for %v at %s\n", r.Name, r.AllowedDomains, r.Scope)
 	}
+	for _, r := range cfg.SSHRoles {
+		if err := k.PutSSHRole(ctx, actor, r.Name, kernel.SSHRoleSpec{
+			Name: r.Name, Scope: r.Scope, AllowedPrincipals: r.AllowedPrincipals,
+			PrincipalsFromRoles: r.PrincipalsFromRoles, MaxTTLSec: r.MaxTTLSec,
+			AllowPTY: r.AllowPTY,
+		}); err != nil {
+			return fmt.Errorf("config: ssh role %s: %w", r.Name, err)
+		}
+		fmt.Fprintf(os.Stderr, "  ssh role %s at %s\n", r.Name, r.Scope)
+	}
+	for _, p := range cfg.RolePolicies {
+		if err := k.PutRolePolicy(ctx, actor, kernel.RolePolicy{
+			Role: p.Role, MinTier: p.MinTier, RequiredAMR: p.RequiredAMR,
+			MaxTTLSec: p.MaxTTLSec, OwnerScope: p.OwnerScope,
+		}); err != nil {
+			return fmt.Errorf("config: role policy %s: %w", p.Role, err)
+		}
+		fmt.Fprintf(os.Stderr, "  role policy %s: tier %d\n", p.Role, p.MinTier)
+	}
 	return nil
 }
 
@@ -338,6 +497,8 @@ func cmdServe(args []string) error {
 	mount := fs.String("mount", "secrets", "KV mount name clients address")
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
+	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
+	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate (serves plain HTTP if unset)")
 	tlsKey := fs.String("tls-key", "", "TLS private key")
 	if err := fs.Parse(args); err != nil {
@@ -363,9 +524,21 @@ func cmdServe(args []string) error {
 			return vaultkv.Status{Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader}
 		},
 	})
+	oidcIssuer := *issuerURL
+	if oidcIssuer == "" {
+		scheme := "http"
+		if *tlsCert != "" {
+			scheme = "https"
+		}
+		oidcIssuer = scheme + "://" + *listen
+	}
+	mux := h.Routes()
+	oidc.New(k, oidc.Config{Issuer: oidcIssuer}).Register(mux)
+	sshca.New(k, sshca.Config{Mount: *sshMount}).Register(mux)
+
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           h.Routes(),
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	fmt.Fprintf(os.Stderr, "signet serving on %s (mount %q -> %s)\n", *listen, *mount, *prefix)

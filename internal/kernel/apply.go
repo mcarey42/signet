@@ -55,6 +55,12 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyPutPKIRole(tx, v)
 	case *op.RecordIssuance:
 		return applyRecordIssuance(tx, v)
+	case *op.PutRolePolicy:
+		return applyPutRolePolicy(tx, v)
+	case *op.PutKey:
+		return applyPutKey(tx, v)
+	case *op.PutSSHRole:
+		return applyPutSSHRole(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -314,6 +320,12 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 		r.Error = res.Err.Error()
 	}
 	switch v := o.(type) {
+	case *op.PutRolePolicy:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Role
+	case *op.PutKey:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Purpose+"/"+v.ID
+	case *op.PutSSHRole:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutCA:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutPKIRole:

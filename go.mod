@@ -1,11 +1,12 @@
 module github.com/mcarey42/signet
 
-go 1.24
+go 1.25.0
 
 require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	go.etcd.io/bbolt v1.4.3
+	golang.org/x/crypto v0.55.0
 )
 
 require (
@@ -19,5 +20,5 @@ require (
 	github.com/hashicorp/golang-lru v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	golang.org/x/sys v0.29.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )

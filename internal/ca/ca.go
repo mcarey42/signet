@@ -78,7 +78,7 @@ type GenesisResult struct {
 // break verification outright in the rustls/webpki family — so DNS, IP, and
 // email subtrees are emitted and URI constraints are not. Primary enforcement
 // is issuer-side, in Sign and Verify below.
-func Genesis(commonName string, permittedDNS []string, rootTTL, intermediateTTL time.Duration, now time.Time) (*GenesisResult, error) {
+func Genesis(commonName string, permittedDNS []string, permittedIPs []*net.IPNet, rootTTL, intermediateTTL time.Duration, now time.Time) (*GenesisResult, error) {
 	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -129,9 +129,18 @@ func Genesis(commonName string, permittedDNS []string, rootTTL, intermediateTTL 
 		interTmpl.PermittedDNSDomains = permittedDNS
 		// Close the cross-type gap: a DNS-only constraint leaves IP and email
 		// name forms unconstrained in a conforming verifier (E-02 F3).
-		interTmpl.ExcludedIPRanges = []*net.IPNet{
-			{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
-			{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		//
+		// A constraint has to permit what the authority is actually expected to
+		// issue. Excluding every IP range is the right default for a CA that
+		// only names hosts by DNS, but it makes IP SANs impossible — so an
+		// authority that must issue them says which ranges instead.
+		if len(permittedIPs) > 0 {
+			interTmpl.PermittedIPRanges = permittedIPs
+		} else {
+			interTmpl.ExcludedIPRanges = []*net.IPNet{
+				{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+				{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+			}
 		}
 		interTmpl.ExcludedEmailAddresses = []string{""}
 	}

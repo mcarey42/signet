@@ -96,8 +96,13 @@ spec:
             # The root ceremony. The root key is written outside the data
             # directory and is never proposed, stored, or backed up.
             - -ca-common-name=Signet Test
-            - -ca-domains=svc.cluster.local,demo.example.com
+            - -ca-domains=svc.cluster.local,demo.example.com,signet.svc
             - -root-key-out=/rootkey/root-ca.key
+            # Kubernetes will only fetch OIDC discovery over HTTPS, so the
+            # domain issues its own serving certificate during the ceremony.
+            - -ca-ip-ranges=10.96.0.0/16
+            - -server-cert-out=/tls
+            - -server-names=signet.signet.svc,10.96.0.20
           volumeMounts:
             - {name: data, mountPath: /data}
             - {name: config, mountPath: /config}
@@ -106,6 +111,7 @@ spec:
             # data volume so it is never part of a backup. A real deployment
             # mounts one-shot storage the operator collects and then destroys.
             - {name: rootkey, mountPath: /rootkey}
+            - {name: tls, mountPath: /tls}
       containers:
         - name: signet
           image: signet:dev
@@ -117,14 +123,18 @@ spec:
             - -mount=secrets-home-solcore-dot-net
             - -tree-prefix=/secrets
             - -pki-mount=pki-home-solcore-dot-net
+            - -issuer-url=https://10.96.0.20:8200
+            - -tls-cert=/tls/tls.crt
+            - -tls-key=/tls/tls.key
           ports:
             - {name: api, containerPort: 8200}
           readinessProbe:
-            httpGet: {path: /v1/sys/health, port: api}
+            httpGet: {path: /v1/sys/health, port: api, scheme: HTTPS}
             initialDelaySeconds: 2
             periodSeconds: 5
           volumeMounts:
             - {name: data, mountPath: /data}
+            - {name: tls, mountPath: /tls}
       volumes:
         - {name: data, emptyDir: {}}
         - {name: config, configMap: {name: signet-genesis}}
@@ -132,6 +142,7 @@ spec:
         # discovery endpoint — Signet never fetches keys from a request.
         - {name: jwks, configMap: {name: signet-jwks}}
         - {name: rootkey, emptyDir: {}}
+        - {name: tls, emptyDir: {}}
 ---
 apiVersion: v1
 kind: Service
@@ -139,6 +150,10 @@ metadata:
   name: signet
   namespace: signet
 spec:
+  # Pinned: the OIDC issuer URL has to be known before the API server is
+  # configured with it, and the API server can route to a ClusterIP but cannot
+  # resolve cluster DNS.
+  clusterIP: 10.96.0.20
   selector: {app: signet}
   ports:
     - {name: api, port: 8200, targetPort: api}
