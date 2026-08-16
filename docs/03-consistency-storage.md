@@ -98,6 +98,18 @@ primary). The sound "get fancy" option is **Roughtime** (authenticated time
 with cross-server lie-detection) — a later enhancement, same detect-don't-
 solely-trust posture.
 
+## Scale envelope & log retention (E-13 F13)
+
+The bbolt/single-writer choice assumes **O(1k) principals per domain**. The
+write sources (issuance log, audit events, session/activation/jti churn, and
+~15-min renewal of every workload credential) are trivial at homelab scale but
+form a real ceiling through one Raft apply loop on Celeron-class hardware. The
+intended scale-out axis is **more domains, not bigger ones** — say so, and set
+a **retention/compaction policy** for the issuance/audit log (unbounded in
+state.db otherwise): the parent reviews ~30 days at renewal, so 30 days is the
+natural floor; older entries compact to the externally-anchored checkpoints
+(11).
+
 ## Remaining open (implementation-stage)
 
 - Segment cadence / old-generation compaction tunables.

@@ -46,6 +46,12 @@ selects a tier:
 A tier-3 claim in an offline token is *structurally impossible*, not merely
 requested — security never depends on relying-party goodwill.
 
+**Tier is a role attribute, not a binding condition (E-13 F3):** the freshness
+tier lives on `RolePolicy` (13), writable only by the role's owner; bindings
+may only *raise* requirements (strictest-wins), so a second weaker binding
+cannot downgrade a tier-3/4 role. This gives the gate a single authoritative
+input.
+
 **Enforcement point (E-01 K-2 — v1 requirement):** the tier gate is enforced
 **once, centrally, in the mint path** (issue → claims → filter → serialize);
 every dialect serializes an already-filtered claim set and no serializer can

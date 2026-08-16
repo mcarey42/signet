@@ -1,7 +1,8 @@
 # 13 — Kernel data model
 
-**Status: Draft** (designed in session 2026-08-16; pending Fable cold-read
-and first-vertical-slice validation)
+**Status: Draft** (designed 2026-08-16; hardened by cold-read E-13; pending
+first-vertical-slice validation)
+Cold-read: [explorations/E-13-cold-read.md](explorations/E-13-cold-read.md)
 
 The kernel is what every dialect serializes over and every property test
 asserts against — so it is specified here concretely, not hand-waved.
@@ -16,115 +17,202 @@ the **domain** stays the blast-radius boundary (charter / E-01):
 1. **Resource tree** — the hierarchical namespace (`/clusters/svc/apps/eso`)
    where roles bind and scope is defined.
 2. **Principal set** — the identities that can hold credentials.
-3. **Authorization set** — role definitions + bindings of
-   *(subject, role, scope, conditions)*.
-4. **Trust graph** — which domains trust which, and how (parent/child chains,
-   peer federations).
+3. **Authorization set** — role definitions + bindings.
+4. **Trust graph** — which domains trust which, and how (02).
 
-## Entities
+## One tree per domain; `/` is domain-relative (E-13 F5, normative)
+
+**Each domain owns exactly one rooted resource tree.** `/` means *that
+domain's* root. `mcarey holds infra-admin at /` means "at `/` of the `home`
+domain." Cross-domain authority does **not** exist implicitly: it exists only
+as an **imported, signed parent-slice reference** (subordinate mode) or a
+**federation artifact** (peer mode) — see "Cross-domain references" below. A
+declared config referencing a path *above* its domain is rejected at plan time
+(14); a reference into a *peer* domain must resolve via a TrustLink.
+
+## Identity is stable; path is a mutable name (E-13 F1, normative)
+
+Every entity has a **stable, never-reused internal ID** (domain-scoped
+serial/UUID). The **path is a unique, mutable *name*** attribute, not the
+identity. All internal references (bindings, memberships, mapping-rule outputs,
+grantor, audit provenance) bind to the **ID**; the path is resolved at issuance
+for scope math and SPIFFE serialization. Consequences, all required:
+
+- **Rename / re-parent** is a first-class audited operation: change the name,
+  ID and all references are untouched. Outstanding credentials carry the old
+  SPIFFE ID until TTL; renewal re-resolves path from ID, so a rename **kills
+  old-path credentials at next renewal** (state this; it's the correct answer).
+- **Delete + recreate at the same path mints a NEW ID.** Stale references to
+  the deleted ID are inert by construction — no silent privilege resurrection
+  (the SID-reuse / k8s-UID bug class). Deletion tombstones the ID.
+
+## Path grammar (E-13 F11, normative)
+
+Kernel paths adopt the **SPIFFE segment grammar** — segments of
+`[a-z0-9._-]`, no empty segments, no `.`/`..`, bounded depth/length — so every
+principal serializes losslessly to a SPIFFE ID in the X.509 dialect and the
+kernel and SPIFFE layers can never disagree. Lowercase-only. Everything else is
+rejected at write time. This kills unicode-confusable (NFC/NFD), case
+(`/Clusters` vs `/clusters`), and empty-component (`//`) bugs in one move.
+Comparison remains **component-wise prefix**, never substring
+(`/clusters/lab` ≠ `/clusters/lab-2`); grants are **additive only** (below).
+
+## Entities (desired state)
 
 ```
-Principal   { id: path            # e.g. /people/mcarey, /clusters/svc/apps/eso
-              kind                 # human | service | machine | workload | group | domain
+Principal   { id: stable-id                # never reused
+              path: name                   # /people/mcarey — mutable, unique
+              kind                         # human|service|machine|workload|group|domain
               home_domain
-              credential_refs      # attestation anchors / keys that authenticate it
-              attributes }         # free-form, non-authoritative metadata
+              credential_refs              # attestation anchors / keys
+              attributes }                 # non-authoritative metadata ONLY (see ABAC note)
 
-Group       # a Principal of kind=group; others are MEMBERS of it
-            { members: [ { principal_ref, not_before?, not_after? } ] }  # membership may be time-bound
+Group       # a Principal of kind=group; MEMBERSHIP is a grant write (F2)
+            { members: [ { principal_ref: id, grantor, not_before?, not_after? } ] }
 
-Role        { name                 # bare label, the narrow-waist RP-facing claim
-              domain               # roles are namespaced to a domain
-              description }         # FLAT — no role nesting (audit-preserving)
+Role        { name; domain; description
+              policy_ref }                 # -> RolePolicy (security floor lives HERE, not on bindings)
 
-Binding     { subject_ref          # a Principal or Group (may be a cross-domain reference)
+RolePolicy  { role
+              min_tier                     # 1..4 freshness floor (06) — a ROLE attribute (F3)
+              required_amr?                # e.g. hardware factor
+              max_ttl?                     # ceiling
+              owner_scope }                # writable only by the role's owner
+
+Binding     { subject_ref: id             # Principal or Group (may be cross-domain import)
               role
-              scope: path          # binds here, inherits DOWNWARD
-              conditions           # tier (06), required amr/freshness, etc.
-              grantor              # who created it (must satisfy delegation-narrows)
-              not_before?, not_after?      # time-bound => JIT grant
-              activation_required? }       # true => eligible-not-active (PAM/sudo)
+              scope: path                  # binds here, inherits DOWNWARD
+              add_conditions               # may only RAISE requirements (strictest-wins, F3)
+              grantor: id                  # subject to delegation-narrows
+              not_before?, not_after?      # time-bound => JIT
+              activation_required? }       # true => eligible-not-active (PAM)
 
-MappingRule { verifier             # which attestation verifier (04)
-              evidence_matcher     # (issuer, subject, claims…) pattern
+MappingRule { verifier; evidence_matcher   # exact-match on enumerated claims; NO regex in v1 (F10)
               produces: principal_ref
-              constraints }        # scoped to the author's subtree (E-01 K-1)
+              grantor; constraints }       # scoped to author's subtree (E-01 K-1)
 
-TrustLink   { kind                 # parent | child | peer
-              target_domain
-              mode                 # subordinate | sovereign (02)
-              anchors / cross_cert }
+TrustLink   { kind: parent|child|peer; target_domain
+              mode: subordinate|sovereign; anchors/cross_cert }
 ```
 
-## Scope & path semantics (E-01 K-4)
+## Grants, constraints, and the tier floor (E-13 F3, normative)
 
-- Paths are **canonicalized**; comparison is **component-wise prefix**, never
-  substring — `/clusters/lab` does **not** match `/clusters/lab-2`.
-- A binding at scope S applies at S and everything below it; **delegation only
-  narrows** — a grantor authorized at S may only create bindings/rules/mappings
-  producing subjects and grants **at or below S**, enforced at write time and
-  re-checked at issuance.
-- Grants are **additive only**; no first-class deny (preserves local reasoning).
+- **Rights are additive** (union of applicable bindings) — preserves local
+  reasoning; no first-class deny.
+- **Constraints on a role are NOT additive — strictest-wins.** The freshness
+  tier and other security floors live on **RolePolicy** (a role attribute),
+  writable only by the role's owner. A Binding's `add_conditions` may only
+  *raise* requirements (more amr, shorter TTL), never lower them. So a
+  second, weaker binding for a tier-4 role **cannot** downgrade it — closing
+  the K-2 gate's data-model input. Named property test: *no binding or
+  membership write can lower the effective tier/floor of any role anywhere.*
 
-## Cross-domain references: explicit, signed — never transitive (Decided)
+## Delegation-only-narrows covers ALL grant writes (E-13 F2, normative)
 
-"Child inherits the parent's graph" (AD-forest ergonomics) is offered **only in
-subordinate mode**, and only as **reference, not replication or automatic
-transitive trust**:
+Bindings, mapping rules, **and group-membership edits** are authorization-
+bearing writes. The invariant — *no sequence of grants **and membership edits**
+by admin-of-S yields a credential valid outside S* — is enforced on all three.
+Concretely for membership (the AD nested-group trap): the effective grant of
+*(member M via group G bound at scope S)* is re-checked at issuance **as if
+`grantor(membership)` had granted M the role at S directly** — so adding a
+member to a group that someone else bound at `/` requires authority at `/`,
+not merely at the group's own path. The flagship property test (10) is
+extended to membership edits.
 
-- The child stores only its own subtree. A binding at the child may reference a
-  **parent** principal/role/group; that reference resolves against a
-  **cached, signed slice of the parent's graph** the parent periodically
-  exports — so resolution is offline-capable.
-- The child **imports** what it chooses to honor; trust flows only the
-  direction configured. A compromised `aws` child therefore cannot assert
-  rights up at `home` or sideways at `gcp`. This is the AD *ergonomics* without
-  the AD *blast radius*.
-- **Sovereign** children (their own root) import nothing implicitly; they
-  federate as peers (02).
+## Grantor lifecycle (E-13 F4, normative)
+
+- **Write-time authority is authoritative for a binding's existence** — no
+  cascade: revoking a delegated admin does *not* silently invalidate every
+  grant they made (that would be an unplanned availability event).
+- **Issuance-time re-check validates scope-containment only** (cheap,
+  stateless) — not live grantor authority.
+- **Revoking an admin produces a `grantor`-indexed review/quarantine report**
+  of every object they authored, for human review, plus a `--revoke-grants`
+  cascade for the compromise (ESC4-persistence) case.
+
+## Cross-domain references: explicit, signed — never transitive
+
+Offered **only in subordinate mode**, as **reference, not replication or
+automatic transitive trust**: the child stores only its own subtree; a binding
+may reference a parent principal/role/group, resolved against a **cached,
+signed slice of the parent's graph** (offline-capable). The child imports what
+it chooses; a compromised `aws` child cannot assert rights up at `home` or
+sideways at `gcp`. Sovereign children import nothing implicitly (they federate
+as peers, 02). Slice format + staleness policy → E-12.
 
 ## JIT / PAM fall out of the model — no new machinery
 
-Both mechanisms are just fields the role-ticket lifecycle (06) already honors,
-because every ~15-min renewal re-evaluates policy:
+Every ~15-min renewal re-evaluates policy (06), so:
 
-- **JIT / time-bounded access** — a `not_after` on a Binding **or** on a Group
-  membership (both supported). The grant simply stops being minted after T; no
-  revocation sweep, no cleanup job. Used for temporary group provisioning and
-  short-lived privileged bindings.
+- **JIT / time-bounded** — `not_after` on a Binding **or** a Group membership
+  (both). The grant stops being minted after T; no sweep.
 - **Role-sudo / PAM (eligible-vs-active)** — `activation_required: true` makes
-  a principal *eligible* for a role without *holding* it. Activation is a
-  **runtime request** (not a config commit) that the kernel grants only with
-  step-up (tier-4 WebAuthn) + optional approval, minting a short-TTL credential
-  carrying the role, fully logged. This is the Azure-PIM eligible/active split.
+  a principal *eligible* without *holding* the role; activation is a **runtime
+  request** granted only with step-up + optional approval (Azure-PIM split).
 
-**Narrow waist preserved:** group membership and eligibility resolve
-**server-side into the flat role-claim set at issuance** — the RP still sees
-only `groups: [infra-admin]`, never nesting. The issuance log records the
-resolved set **and the why** (which binding / activation / approval), so audit
-stays tractable.
+**Narrow waist preserved:** membership and eligibility resolve **server-side
+into the flat role-claim set at issuance**; the RP sees only
+`groups: [infra-admin]`. The issuance log records the resolved set **and the
+why** (binding / activation / approval).
 
-## Desired-state vs runtime-state (load-bearing for PAM)
+## Runtime entities (E-13 F9 — the other half of the model)
 
-- **Desired state** (declarative, git/reconciled — doc 14): principals, groups,
-  roles, bindings, mapping rules, trust links — *who is eligible for what*.
-- **Runtime state** (dynamic, never in git): live sessions, minted credentials,
-  **JIT activations**. You *declare eligibility*; you *activate at runtime*
-  through an API. `sudo` must never require a git push (too slow, too
-  permanent, and it puts elevation in version control).
+Dynamic state; **never declarative** (not in git). Lives in the FSM (03).
 
-## Secrets in the same keyspace
+```
+Session          { principal_ref: id; sender_binding_key_ref; amr; auth_time;
+                   upstream_verifier; expiry; killed? }
+Activation       { requester: id; binding_ref; approver_refs; stepup_evidence;
+                   expiry; killed? }            # PAM activation record
+IssuedCredRef    { opaque_ref; principal_ref; role_set; tier; expiry }  # tier-3 introspection lookup
+JoinTokenUse     { token_id; used_at; bound_principal }                 # single-use enforcement
+BundleEpoch      { domain; epoch; issued_at }                           # FED-1 monotonic state
+DPoPReplay       { jti; exp }                                           # AG-3 replay cache
+```
 
-KV secrets (v1: static KV v2 only; dynamic/leased secrets explicitly deferred)
-live in the same bbolt FSM keyspace (03) as versioned entries. The Vault-compat
-dialect (E-06) serializes over them. Version history is a **kernel storage
-requirement**, not dialect state.
+**Activation semantics (each a classic bug if unstated):**
+1. An activation is a **grant window**; each 15-min renewal inside it
+   **re-validates the activation record AND the underlying binding** — either
+   vanishing kills at next renewal. A server-side activation-kill also revokes
+   the session-side path (mirrors session kill).
+2. Activation expiry and every credential minted under it are **clamped to the
+   binding's/membership's `not_after`** (JIT-on-JIT — no "eligible until
+   Friday, activated Thursday 23:59 for 4h" leak).
+3. **Approval re-validates the binding at grant time**, not request time
+   (approval-race safe).
+4. The **step-up assertion is bound to that specific activation/approval**
+   (challenge carries the request hash) — no relayed-touch approval of a
+   different request (extends E-01 AT-5 to activations).
 
-## Open / for cold-read (E-13)
+## KV dialect authorization (E-13 F8 — the actual v1 success path)
 
-- Attribute model: how far do non-authoritative principal attributes go before
-  they tempt ABAC creep? (Keep policy = data, not code.)
-- Group-of-groups: members are principals; a group can contain a group, but
-  resolution stays flat at issuance — confirm no cycles / bounded depth.
-- Exact cached-parent-slice format + staleness policy (ties to E-12 bundles).
-- Whether roles ever carry structured attributes or stay pure labels (05).
+The first success criterion is "ESO reads a secret," so it is specified:
+
+- **Secrets are nodes in the resource tree** — the Vault mount/path prefix maps
+  to a tree path (`secrets-home-solcore-dot-net/cluster-svc/apps/litellm` →
+  `/clusters/svc/secrets/apps/litellm`, exact mapping tabled next to the E-06
+  compat spec in 07). Scope machinery and per-subtree DEKs (11) then apply for
+  free, including per-app sub-path isolation (what the homelab does today).
+- **Reserved, Signet-dialect-owned roles** with fixed verb sets in v1:
+  `kv-reader` (get/list), `kv-writer` (+put), `kv-admin` (+delete/destroy/
+  metadata). Narrow waist intact — these are the dialect's own role→permission
+  mapping, exactly as Grafana owns `infra-admin → Admin`. A binding scopes one
+  of these at a secrets sub-path.
+
+## Notes / deliberate deferrals
+
+- **ABAC containment**: `attributes` is non-authoritative metadata *only* —
+  policy stays data (bindings), never attribute expressions, or ABAC creep
+  swallows the model. `evidence_matcher` is exact-match on enumerated fields,
+  **no regex in v1** (same creep, worse — it's on the auth path). Templated
+  mapping rules deferred; when added, K-1 must validate the template's *range*,
+  not an instance (recorded in 04).
+- **MappingRule conflict** (F10): **unique-match-or-fail-closed** — ambiguity
+  is an error at plan time when statically detectable, else at login, loudly
+  audited. No rule ordering (avoids firewall-rule politics).
+- **Additive-only boundary story** (F12): "admin everywhere except X" is
+  inexpressible by design; the escape hatch is **domain topology** (a separate
+  subdomain is the deny boundary). The AD block-inheritance alternative is
+  rejected — recorded in 05's Reconsideration.
+- Group-of-groups allowed but resolution stays flat + acyclic/bounded-depth at
+  issuance (confirm termination).

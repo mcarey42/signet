@@ -1,9 +1,11 @@
 # 14 — Control plane & node lifecycle
 
-**Status: Draft** (designed 2026-08-16)
+**Status: Draft** (designed 2026-08-16; hardened by cold-read E-13)
 
 How operators configure Signet, and how domains and nodes are born and grow.
-Consumer-facing dialects are doc 07; this is the *operator* plane.
+Consumer-facing dialects are doc 07; this is the *operator* plane. "(Decided)"
+below marks positions settled in design discussion; while the doc is Draft they
+remain validated-at-first-slice, not Reconsideration-gated.
 
 ## Declarative, reconcilable control plane (Decided)
 
@@ -21,6 +23,33 @@ principals, groups, roles, bindings, mapping rules, trust links.
 - **Desired state only.** Runtime state (sessions, minted credentials, JIT
   activations) is never declarative — see the PAM split in 13. Eligibility is
   declared; **activation is a runtime API call** (with step-up), not a commit.
+
+### Authorship & authority (E-13 F7, normative)
+
+Plan-time narrows enforcement requires knowing **which principal authored which
+part of a diff** — git state alone is not an authenticated identity. Rules:
+
+- A reconcile apply runs **as an authenticated Signet principal** (the applier);
+  the whole diff is checked against that principal's authority unless the repo
+  provides **per-principal signed commits** mapped to principals (then each
+  hunk is checked against its author). v1: applier-authority + a documented note
+  that **repo write access is then an authorization boundary** — so the config
+  repo and its CI deploy credential are **tier-0 assets** (added to doc 01).
+- **Trust-graph writes escape subtree containment** — a TrustLink (add a peer
+  anchor, change a child's mode) is scope-above-everything. They require
+  **domain-owner authority + tier-4 step-up**, never a plain subtree admin.
+  This is a distinct rule from binding narrows.
+- **Plan/apply concurrency**: apply carries the state serial the plan was
+  computed against; a mismatch (state moved) **rejects** (optimistic
+  concurrency, no TOCTOU).
+- **Imperative writes & drift**: break-glass/API-created bindings are
+  desired-state-shaped; the reconciler must have a **drift policy** (adopt vs
+  prune vs alert) so it doesn't fight an emergency grant. JIT activations are
+  runtime state and exempt.
+- **Deletion cascade**: removing a principal from git tombstones its ID (13);
+  live sessions die at next renewal (path re-resolves to tombstone); bindings
+  referencing a now-missing subject are flagged in the plan, not silently
+  dropped.
 
 ## Node & domain lifecycle
 
@@ -42,6 +71,27 @@ posture** (root resident, maximal authority) past the bootstrap window.
 "Seal genesis, enter operational" is an explicit ceremony (ties to E-09 seal /
 11 ops). Single-node *operational* (root offline, one voter) is a safe
 permanent config for small sites.
+
+**Root-key persistence (E-13 F6, normative).** The root **private** key is
+generated *in the ceremony tool and never persisted to the FSM* — only the
+root *cert* and the first intermediate enter state. This is required because
+the Raft log IS the WAL (03): anything written to state lands in immutable,
+create-only backup generations forever, so a root key touching state makes
+"root is offline" permanently false in the DR chain. Operational-mode entry
+verifies, as a **checked postcondition**, "no root private material in the
+store or in any retained backup generation" (forces a generation break +
+destruction of any pre-seal generation that could contain it). Genesis-crash
+semantics: memory-only root ⇒ a crash before sealing loses the domain root, so
+"mint first intermediate + first admin" must be **idempotently re-runnable**,
+and any child that pinned a lost root is re-bootstrapped.
+
+**First-admin bootstrap trust boundary (E-13 F6).** Before any WebAuthn
+credential or mapping rule exists, the CLI performing genesis is authorized by
+**local process identity / filesystem access to the empty data dir**. State
+this plainly: whoever can run the binary against the empty data dir at that
+moment owns the domain forever — so genesis happens in a controlled
+environment, and the first durable admin (WebAuthn) is enrolled as part of the
+same ceremony before the box is exposed.
 
 ### Growing the Raft group — non-voters, never even (Decided, E-03/hashicorp-raft)
 

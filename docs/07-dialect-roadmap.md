@@ -27,6 +27,13 @@ against the first deployment (replace OpenBao, add SSO) and by risk.
    always present (null = non-expiring), missing secrets are
    `404 {"errors":[]}`, and LIST arrives as `GET ?list=true`. ~2–3k LoC of
    dialect code. Full spec: explorations/E-06-vault-compat.md.
+   **KV authorization mapping (E-13 F8):** secret paths are nodes in the
+   resource tree (Vault mount/path prefix → tree path, e.g.
+   `secrets-home-solcore-dot-net/cluster-svc/apps/litellm` →
+   `/clusters/svc/secrets/apps/litellm`); reserved dialect-owned roles
+   `kv-reader`/`kv-writer`/`kv-admin` with fixed verb sets; a binding scopes one
+   at a secrets sub-path (per-app isolation). Full mapping table lives here next
+   to the compat spec; semantics in 13.
 3. **SSH certificates** (OpenSSH CA). Tiny surface, huge value: agent fetches
    short-lived certs, hosts get one `TrustedUserCAKeys` +
    `AuthorizedPrincipalsFile` line. Kills key sprawl fleet-wide.

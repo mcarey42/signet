@@ -25,6 +25,9 @@ per charter principle 3 — never dependent on relying-party goodwill.
 - **Attestation trust anchors** (k8s issuer JWKS, TPM/vendor CAs, upstream IdP
   keys, cloud IID signers) and **federation bundles / pins**.
 - The **seal / at-rest data key** and backups.
+- The **declarative config repo and its CI deploy credential** (E-13 F7) — a
+  **tier-0 asset**: repo write access can inject trust links, mapping rules,
+  and bindings. Treat as trust-anchor-injection-capable; protect accordingly.
 
 ## Trust boundaries
 
