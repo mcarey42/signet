@@ -5,3 +5,8 @@
 # local scratch
 *.local.md
 /tmp/
+
+# build artifacts
+/signet
+/data/
+*.token

@@ -37,12 +37,19 @@ computed). **One write path** ⇒ consistency, audit, and encryption each
 enforced in one place. Four contracts make this correct (all cheap now,
 expensive to retrofit — E-15):
 
-1. **Determinism (normative).** `FSM.Apply(op, state)` is a **pure function** —
-   same Op + prior state ⇒ same next state, on every node, in every decade.
-   Apply reads **no clock, no rand, no network, no `context`**. All
-   nondeterminism is resolved at **propose time** and carried in the Op
+1. **Determinism *and* idempotence (normative).** `FSM.Apply(op, state)` is a
+   **pure function** — same Op + prior state ⇒ same next state, on every node,
+   in every decade. Apply reads **no clock, no rand, no network, no `context`**;
+   all nondeterminism is resolved at **propose time** and carried in the Op
    (timestamps = leader clock, matching 03's "TTLs are leader-clock-relative").
    Required because 03's restore **replays backup segments through Apply**.
+   **Separately**, because Signet's state is durable while Raft replays
+   committed entries from the last snapshot on restart, Apply must be
+   **idempotent under replay**: an applied-index watermark is persisted in the
+   same transaction as each mutation, and entries at or below it are skipped.
+   Determinism alone does not give this — a version counter is deterministic
+   and still drifts if replayed onto its own result. (Found by the first
+   checkpoint; see the build sequence below.)
 2. **Tokens: hash-in-Op.** The proposer generates the bearer token, puts **only
    its hash** in the Op, and returns the raw token it already holds via the
    future. The raw token never enters the log, FSM, snapshot, or backup. Lookup
@@ -186,9 +193,24 @@ final one, not a fork.
 
 ## Build sequence (E-14 R5 — 3 independently-green states, no throwaway)
 
-1. **Curl checkpoint** (~day 2–3): `genesis` + `kv put` + `curl -H X-Vault-Token
-   … /v1/{mount}/data/foo`. Proves the whole spine (Op → Raft → Apply → barrier
-   → bbolt → session lookup → envelope) before any JWT exists.
+1. ✅ **Curl checkpoint — DONE (2026-08-16).** `genesis` + `kv put` + `curl -H
+   X-Vault-Token … /v1/{mount}/data/foo` works end to end. The whole spine is
+   proven: Op → Raft → Apply → barrier → bbolt → session lookup → envelope.
+   Scaffold: 6 packages, 3 direct deps, **12 MB binary**, tests green
+   (determinism-under-replay, delegation-narrows property test, CAS, the E-06
+   bug-compat fixtures, restart-safety). Verified out-of-band: no plaintext
+   secret in `state.db` or `raft.db`, and no raw bearer token anywhere on disk.
+
+   **One real bug found by the checkpoint, worth recording:** a secret's version
+   went 1 → 2 across a restart. Apply was deterministic but not *idempotent*:
+   Raft replays committed entries from the last snapshot on restart, and because
+   Signet's state is durable (unlike an in-memory FSM), replayed entries applied
+   a second time on top of their own results. Anything accumulating would drift
+   on every restart. Fixed by persisting an applied-index watermark in the same
+   transaction as each mutation and skipping entries at or below it — the
+   standard durable-FSM guard. Now regression-tested across repeated restarts.
+   *Determinism and idempotence are separate properties; docs/15 contract 1
+   only named the first.*
 2. **ESO-unmodified via token auth** (mid-slice): ESO token auth does **zero**
    login calls (E-06) — the token goes straight into `X-Vault-Token`. Real ESO
    in kind reads a real secret with **no attestation code written yet**. Free

@@ -1,0 +1,173 @@
+package fsm
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/mcarey/signet/internal/op"
+	"github.com/mcarey/signet/internal/store"
+)
+
+// Node is one Signet domain member: the store, the FSM, and the Raft instance
+// that serializes writes into it.
+//
+// The MVP runs a single voter and carries NO membership machinery — no join,
+// no promotion, no network transport. Growing a domain is the multi-node
+// milestone, where peers join as non-voters and voter counts stay odd
+// (docs/14). Keeping that code absent is deliberate: what is not here cannot
+// be half-right.
+type Node struct {
+	raft  *raft.Raft
+	st    *store.Store
+	logs  *raftboltdb.BoltStore
+	trans *raft.InmemTransport
+	id    string
+}
+
+type Config struct {
+	DataDir  string
+	SealKey  string
+	NodeID   string
+	LogLevel string // raft log level; "ERROR" keeps startup quiet
+}
+
+// Open brings up the store and Raft, bootstrapping a single-voter cluster the
+// first time.
+func Open(cfg Config) (*Node, error) {
+	if cfg.NodeID == "" {
+		cfg.NodeID = "signet-0"
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "ERROR"
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		return nil, err
+	}
+
+	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"), store.KeyFileSeal{Path: cfg.SealKey})
+	if err != nil {
+		return nil, err
+	}
+
+	logs, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
+	if err != nil {
+		st.Close()
+		return nil, fmt.Errorf("fsm: open raft log: %w", err)
+	}
+	snaps, err := raft.NewFileSnapshotStore(cfg.DataDir, 2, io.Discard)
+	if err != nil {
+		logs.Close()
+		st.Close()
+		return nil, err
+	}
+
+	rcfg := raft.DefaultConfig()
+	rcfg.LocalID = raft.ServerID(cfg.NodeID)
+	rcfg.LogLevel = cfg.LogLevel
+	rcfg.LogOutput = os.Stderr
+
+	_, trans := raft.NewInmemTransport(raft.ServerAddress(cfg.NodeID))
+
+	hasState, err := raft.HasExistingState(logs, logs, snaps)
+	if err != nil {
+		logs.Close()
+		st.Close()
+		return nil, err
+	}
+
+	r, err := raft.NewRaft(rcfg, New(st), logs, logs, snaps, trans)
+	if err != nil {
+		logs.Close()
+		st.Close()
+		return nil, fmt.Errorf("fsm: start raft: %w", err)
+	}
+	if !hasState {
+		f := r.BootstrapCluster(raft.Configuration{Servers: []raft.Server{
+			{ID: rcfg.LocalID, Address: trans.LocalAddr()},
+		}})
+		if err := f.Error(); err != nil {
+			return nil, fmt.Errorf("fsm: bootstrap: %w", err)
+		}
+	}
+	return &Node{raft: r, st: st, logs: logs, trans: trans, id: cfg.NodeID}, nil
+}
+
+func (n *Node) Store() *store.Store { return n.st }
+
+// WaitForLeader blocks until this node has won its (uncontested) election.
+func (n *Node) WaitForLeader(ctx context.Context) error {
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if n.raft.State() == raft.Leader {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("fsm: no leader: %w", ctx.Err())
+		case <-tick.C:
+		}
+	}
+}
+
+// Propose encrypts an Op, commits it through Raft, and returns what Apply
+// computed. The barrier pass happens here, at propose time, so the Raft log and
+// every backup segment built from it hold ciphertext only (docs/03).
+func (n *Node) Propose(ctx context.Context, o op.Op) (op.Result, error) {
+	raw, err := op.Encode(o)
+	if err != nil {
+		return op.Result{}, err
+	}
+	sealed, err := n.st.Barrier().SealRandom(raw, opAAD)
+	if err != nil {
+		return op.Result{}, err
+	}
+
+	timeout := 10 * time.Second
+	if dl, ok := ctx.Deadline(); ok {
+		timeout = time.Until(dl)
+	}
+	f := n.raft.Apply(sealed, timeout)
+	if err := f.Error(); err != nil {
+		return op.Result{}, fmt.Errorf("propose %s: %w", o.OpKind(), err)
+	}
+	res, ok := f.Response().(op.Result)
+	if !ok {
+		return op.Result{}, fmt.Errorf("propose %s: unexpected apply result %T", o.OpKind(), f.Response())
+	}
+	return res, res.Err
+}
+
+// Status reports what sys/health needs. Seal and consensus state are server
+// questions, not identity questions, so this lives here and not in the kernel.
+type Status struct {
+	Initialized bool
+	Sealed      bool
+	Leader      bool
+	NodeID      string
+}
+
+func (n *Node) Status() Status {
+	return Status{
+		Initialized: true,
+		Sealed:      false, // the MVP unseals at startup or fails to start
+		Leader:      n.raft.State() == raft.Leader,
+		NodeID:      n.id,
+	}
+}
+
+func (n *Node) Close() error {
+	if err := n.raft.Shutdown().Error(); err != nil {
+		return err
+	}
+	if err := n.logs.Close(); err != nil {
+		return err
+	}
+	return n.st.Close()
+}

@@ -38,9 +38,43 @@ the same object: a signed claim of *who, what scope, until when*.
 
 ## Status
 
-Design phase. See [docs/](docs/README.md) for the charter, design documents,
-and open questions. Nothing here is code yet — the documents are the product
-right now.
+**MVP scaffold, first checkpoint green.** A single-node domain runs: genesis
+initializes it, the Vault-compatible KV dialect serves reads and writes, scoped
+RBAC bounds them, and state survives restart. See
+[docs/15-mvp-plan.md](docs/15-mvp-plan.md) for what is deliberately deferred
+(OIDC, SSH, agents, federation, internal CA) and [docs/](docs/README.md) for the
+design record behind every decision.
+
+```bash
+make test && make build
+
+# initialize a domain — prints a root token, writes a seal key
+signet genesis -data-dir ./data -config genesis.json
+
+# serve the Vault-compatible API
+signet serve -data-dir ./data -listen 127.0.0.1:8200 -mount secrets
+
+# write and read a secret
+signet kv put -token "$TOKEN" -mount secrets apps/litellm master-key=sk-abc
+curl -H "X-Vault-Token: $TOKEN" localhost:8200/v1/secrets/data/apps/litellm
+```
+
+`genesis.json` declares desired state — principals and the roles they hold at a
+scope. Runtime state (sessions, tokens) is never declared:
+
+```json
+{
+  "principals": [{"path": "/clusters/svc/apps/eso", "type": "workload"}],
+  "bindings": [{"subject": "/clusters/svc/apps/eso",
+                "role": "kv-reader", "scope": "/secrets/cluster-svc"}]
+}
+```
+
+### Building
+
+The toolchain needs `flock`, which this repo's NFS mount does not provide, so
+the `Makefile` builds and tests from a local-disk mirror. On a normal
+filesystem, plain `go build ./...` works too.
 
 First real deployment target: a homelab currently running OpenBao + fleet PKI,
 replacing the secrets/PKI layer and adding identity/SSO — then generalizing.
