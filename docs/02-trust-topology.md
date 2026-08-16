@@ -87,6 +87,58 @@ another's identities). The chain hierarchy remains the *distribution and
 revocation* structure; it is not the workload-identity *authorization*
 boundary at third-party verifiers.
 
+### Child modes: subordinate vs sovereign (Decided)
+
+Delegation is a **per-child mode**, not one fixed relationship. The governing
+law: a credential is sovereign against the parent *iff relying parties verify
+something the child controls* — a child secret confers no protection unless
+the verifier's acceptance rule takes the child's public key as an input.
+(A signature nobody checks is worthless; this is logical, not cryptographic.)
+
+- **Subordinate mode (default, intra-org).** The child is a name-constrained
+  intermediate under the parent root (the model above). The parent is
+  legitimately all-powerful over the subtree — that is what one org's tree
+  *means* — and DB-1 applies: no sovereignty against the parent. Correct for
+  the homelab and most single-org trees.
+
+- **Sovereign mode.** The child is **its own root**; the parent issues a
+  **cross-certificate** endorsing that root for hierarchy/discovery only. RPs
+  verify against the child's root (from the trust bundle), so the parent
+  *cannot* mint in the child's namespace — it was never in the leaf path. Fully
+  offline and partition-tolerant (the child signs its own leaves). A sovereign
+  child is simply a **federated peer that also carries a parent cross-cert** —
+  same machinery as "federation between equals," so no new architecture, just a
+  policy knob + the federation/bundle format (E-12).
+
+  Sovereign mode composes with three optional hardenings (design inputs to
+  E-12):
+  - **Self-certifying namespace** — derive the trust-domain label from the
+    child key, `spiffe://<base32(H(child_root_pubkey))>/…` (RFC 3972 / onion /
+    IPFS-CID style). The verifier rule "trust-domain segment == H(signing key)"
+    *structurally* requires the child key — parent forgery is mathematically
+    impossible with **zero RP configuration**. Cost: hash-shaped names need a
+    friendly-name → self-certifying-name discovery layer.
+  - **Transparency / key transparency (CONIKS/KT)** — for orgs that want the
+    parent to retain issuing convenience but guarantee rogue issuance is
+    *detectable*: append-only Merkle log of authorized keys/intermediates,
+    inclusion proofs on credentials, child monitors for unauthorized entries,
+    gossip catches split-view. Detection, not prevention; RP-offline (checks a
+    compact proof).
+  - **Threshold child key (FROST / threshold Ed25519)** — k-of-n shares so even
+    a child-server compromise can't unilaterally mint (hardens the child side
+    of DB-3); produces an ordinary Schnorr/Ed25519 signature, no special RP
+    logic.
+
+Note on per-issuance liveness (the nonce+timestamp idea): requiring a fresh
+child signature over `H(contents ‖ nonce ‖ timestamp)` on *every leaf* proves
+the child was live at mint time, but forces the child online for every
+issuance (killing delegated partition-tolerance) and needs the RP to judge
+nonce freshness (online, or clock-dependent — TIME-1). So it is **not** used
+for the offline base case; it is the right mechanism for **online-tier**
+endorsements (06 tiers 3–4), where a resource wants "the child authority
+endorsed this *now*." Sovereign mode gets parent-non-impersonation for free
+via cross-cert, without per-mint child participation.
+
 ### Parent power over a child (E-01 DB-1 — stated honestly)
 
 A parent holds the root and can, offline, mint a **second** intermediate

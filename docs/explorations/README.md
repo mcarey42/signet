@@ -24,7 +24,7 @@ and what would change the conclusion.
 | E-09 | **Seal/unseal ceremony design** — TPM, cloud KMS, Shamir; init/rekey/rotate/migrate ceremonies; what Vault got wrong operationally and how to avoid it | 11 | P1 |
 | E-10 | **Interop test harness design** — kind + containerized real clients (ESO, cert-manager, Grafana, sshd) as a CI release gate; headless browser SSO flows | 10 | P2 |
 | E-11 | **Prior-art mining** — what Zitadel, Kanidm, SPIRE, Teleport, step-ca each got right/wrong at the module level (issuance paths, agent UX, HA story); steal shamelessly, cite | all | P2 |
-| E-12 | **Federation artifact format** — SPIFFE bundle format suitability, revocation transport between domains, bundle refresh/pinning protocol | 02 | P1 |
+| E-12 | **Federation artifact format & sovereign-child mechanics** — SPIFFE bundle format suitability, revocation transport, bundle refresh/pinning protocol; PLUS the sovereign-child crypto (doc 02 "Child modes"): cross-certificate format parent↔child-root; optional self-certifying namespace (RFC 3972-style, name=H(child key)) + friendly-name discovery layer; optional CONIKS/Key-Transparency log (inclusion proofs, monitoring, split-view/gossip); optional FROST/threshold-Ed25519 child root key; and where per-issuance liveness (nonce+timestamp child sig) belongs in the online tiers (06). Must satisfy FED-1/2/3/4 requirements from E-01. | 02 | P1 |
 
 ## Sequencing
 
