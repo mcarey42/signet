@@ -9,8 +9,21 @@
   storage; nothing imports a dialect.
 - **Dependency budget** (server): one Raft library, one embedded KV store,
   Go stdlib for crypto/TLS/X.509/HTTP/JSON. Every additional dependency needs
-  a written exception in this doc (candidate exceptions so far: an ASN.1
-  helper if stdlib gaps bite; XML-DSig if/when SAML lands).
+  a written exception in this doc.
+
+  Exceptions granted so far:
+  - `golang.org/x/crypto/ssh` — the OpenSSH certificate wire format has exact
+    framing and this is the implementation the ecosystem is written against;
+    hand-rolling it would mean hand-rolling the part where mistakes are silent.
+    Pinned to a current release (`go mod tidy` initially resolved a 2020
+    pseudo-version, which is not acceptable on a signing path).
+  - `github.com/miekg/pkcs11` — hardware seals, **behind the `pkcs11` build
+    tag**. PKCS#11 is a C ABI, so this pulls in cgo; the default build stays
+    static and pure-Go, and a binary built without the tag refuses a configured
+    hardware seal rather than silently falling back.
+
+  Candidate future exceptions: an ASN.1 helper if stdlib gaps bite; XML-DSig
+  if/when SAML lands.
 - **Never hand-rolled**: crypto primitives, consensus, TLS.
 - Agents share the kernel's client libraries from the same repo; native shims
   live in `agents/shims/<platform>/` with their own build chains.

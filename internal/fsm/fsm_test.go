@@ -8,14 +8,14 @@ import (
 
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
-	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/seal"
 )
 
 // openNode brings up a domain over a fixed directory, so a test can close it
 // and open it again the way a restart does.
 func openNode(t *testing.T, dir, keyPath string) (*fsm.Node, *kernel.Kernel) {
 	t.Helper()
-	node, err := fsm.Open(fsm.Config{DataDir: filepath.Join(dir, "data"), SealKey: keyPath})
+	node, err := fsm.Open(fsm.Config{DataDir: filepath.Join(dir, "data"), Seal: "file://" + keyPath})
 	if err != nil {
 		t.Fatalf("open node: %v", err)
 	}
@@ -25,7 +25,7 @@ func openNode(t *testing.T, dir, keyPath string) (*fsm.Node, *kernel.Kernel) {
 		node.Close()
 		t.Fatalf("wait for leader: %v", err)
 	}
-	return node, kernel.New(node.Store(), node)
+	return node, kernel.New(node.Store(), node, node.Seal())
 }
 
 // Restarting a node replays committed entries from the last snapshot. Because
@@ -37,7 +37,7 @@ func openNode(t *testing.T, dir, keyPath string) (*fsm.Node, *kernel.Kernel) {
 func TestRestartDoesNotReapplyEntries(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "seal.key")
-	if err := store.GenerateKeyFile(keyPath); err != nil {
+	if err := seal.GenerateKeyFile(keyPath); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -92,7 +92,7 @@ func TestRestartDoesNotReapplyEntries(t *testing.T) {
 func TestScopeSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "seal.key")
-	if err := store.GenerateKeyFile(keyPath); err != nil {
+	if err := seal.GenerateKeyFile(keyPath); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()

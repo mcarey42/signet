@@ -125,7 +125,7 @@ func (h *Handler) publicKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "no ssh certificate authority configured")
 		return
 	}
-	pub, err := CAPublicKey(key)
+	pub, err := CAPublicKey(key, h.k.Seal())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return

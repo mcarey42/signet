@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
@@ -28,11 +29,14 @@ type Node struct {
 	logs  *raftboltdb.BoltStore
 	trans *raft.InmemTransport
 	id    string
+	seal  seal.Seal
 }
 
 type Config struct {
-	DataDir  string
-	SealKey  string
+	DataDir string
+	// Seal is a seal URI: file:///path/to/key or
+	// pkcs11:?module=...&token=...&pin=...&label=...
+	Seal     string
 	NodeID   string
 	LogLevel string // raft log level; "ERROR" keeps startup quiet
 }
@@ -50,8 +54,20 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"), store.KeyFileSeal{Path: cfg.SealKey})
+	sl, err := seal.Open(cfg.Seal)
 	if err != nil {
+		return nil, err
+	}
+	// The root key exists only in wrapped form on disk; with a hardware seal
+	// the data directory cannot be opened without the device.
+	rootKey, err := seal.LoadOrCreateRootKey(sl, cfg.DataDir)
+	if err != nil {
+		sl.Close()
+		return nil, err
+	}
+	st, err := store.Open(filepath.Join(cfg.DataDir, "state.db"), rootKey)
+	if err != nil {
+		sl.Close()
 		return nil, err
 	}
 
@@ -95,10 +111,13 @@ func Open(cfg Config) (*Node, error) {
 			return nil, fmt.Errorf("fsm: bootstrap: %w", err)
 		}
 	}
-	return &Node{raft: r, st: st, logs: logs, trans: trans, id: cfg.NodeID}, nil
+	return &Node{raft: r, st: st, logs: logs, trans: trans, id: cfg.NodeID, seal: sl}, nil
 }
 
 func (n *Node) Store() *store.Store { return n.st }
+
+// Seal is the key custodian this node was opened with.
+func (n *Node) Seal() seal.Seal { return n.seal }
 
 // WaitForLeader blocks until this node has won its (uncontested) election.
 func (n *Node) WaitForLeader(ctx context.Context) error {
@@ -151,14 +170,18 @@ type Status struct {
 	Sealed      bool
 	Leader      bool
 	NodeID      string
+	SealName    string
+	SealKeyID   string
 }
 
 func (n *Node) Status() Status {
 	return Status{
 		Initialized: true,
-		Sealed:      false, // the MVP unseals at startup or fails to start
+		Sealed:      false, // Signet unseals at startup or refuses to start
 		Leader:      n.raft.State() == raft.Leader,
 		NodeID:      n.id,
+		SealName:    n.seal.Name(),
+		SealKeyID:   n.seal.KeyID(),
 	}
 }
 
@@ -169,5 +192,8 @@ func (n *Node) Close() error {
 	if err := n.logs.Close(); err != nil {
 		return err
 	}
-	return n.st.Close()
+	if err := n.st.Close(); err != nil {
+		return err
+	}
+	return n.seal.Close()
 }

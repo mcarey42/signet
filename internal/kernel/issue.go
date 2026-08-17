@@ -10,6 +10,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/keys"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
@@ -67,6 +68,17 @@ func applyPutKey(tx *store.Tx, o *op.PutKey) op.Result {
 	if o.ID == "" || o.Purpose == "" || len(o.Key) == 0 {
 		return op.Result{Err: errors.New("key: missing id, purpose, or material")}
 	}
+	// A key record reaching the log with plaintext material would defeat the
+	// envelope entirely, so it is rejected rather than quietly accepted.
+	var probe struct {
+		Private []byte `json:"private"`
+	}
+	if err := json.Unmarshal(o.Key, &probe); err != nil {
+		return op.Result{Err: fmt.Errorf("key: %w", err)}
+	}
+	if len(probe.Private) != 0 {
+		return op.Result{Err: errors.New("key: refusing plaintext private material; keys must be sealed before they are proposed")}
+	}
 	if err := requireDomainAuthority(tx, o.Grantor, o.AtSec); err != nil {
 		return op.Result{Err: fmt.Errorf("key: %w", err)}
 	}
@@ -109,8 +121,8 @@ type Claims struct {
 // no way to embed a role the gate excluded — the filtering is not a rule
 // serializers are asked to follow, it is a property of what they are given.
 type Serializer interface {
-	Serialize(c Claims, k *keys.Key) ([]byte, error)
-	Verify(cred []byte, c Claims, k *keys.Key) error
+	Serialize(c Claims, k *keys.Key, sl seal.Seal) ([]byte, error)
+	Verify(cred []byte, c Claims, k *keys.Key, sl seal.Seal) error
 }
 
 // IssueRequest is one credential request.
@@ -164,14 +176,14 @@ func (k *Kernel) Issue(ctx context.Context, s Session, req IssueRequest, ser Ser
 		return nil, Claims{}, err
 	}
 
-	cred, err := ser.Serialize(claims, key)
+	cred, err := ser.Serialize(claims, key, k.seal)
 	if err != nil {
 		return nil, Claims{}, err
 	}
 	// Verify-after-sign. The serializer re-reads what it produced; a credential
 	// that fails here is never returned, because once released it cannot be
 	// recalled.
-	if err := ser.Verify(cred, claims, key); err != nil {
+	if err := ser.Verify(cred, claims, key, k.seal); err != nil {
 		return nil, Claims{}, fmt.Errorf("refusing to release credential: %w", err)
 	}
 	return cred, claims, nil
@@ -275,7 +287,12 @@ func loadActiveKey(tx *store.Tx, purpose keys.Purpose) (*keys.Key, error) {
 
 // InstallKey stores a signing key, optionally making it the active one.
 func (k *Kernel) InstallKey(ctx context.Context, grantor op.ID, key *keys.Key, active bool) error {
-	blob, err := json.Marshal(key)
+	// Seal before proposing: the log must never see the private half.
+	sealed, err := key.Seal(k.seal)
+	if err != nil {
+		return err
+	}
+	blob, err := json.Marshal(sealed)
 	if err != nil {
 		return err
 	}

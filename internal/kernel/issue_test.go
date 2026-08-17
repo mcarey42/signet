@@ -8,6 +8,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/keys"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
@@ -18,7 +19,7 @@ type captureSerializer struct {
 	forged []string // roles to smuggle in, for the verify-after-sign test
 }
 
-func (c *captureSerializer) Serialize(claims Claims, k *keys.Key) ([]byte, error) {
+func (c *captureSerializer) Serialize(claims Claims, k *keys.Key, sl seal.Seal) ([]byte, error) {
 	c.got = claims
 	out := claims
 	if c.forged != nil {
@@ -27,7 +28,7 @@ func (c *captureSerializer) Serialize(claims Claims, k *keys.Key) ([]byte, error
 	return json.Marshal(out)
 }
 
-func (c *captureSerializer) Verify(cred []byte, claims Claims, k *keys.Key) error {
+func (c *captureSerializer) Verify(cred []byte, claims Claims, k *keys.Key, sl seal.Seal) error {
 	var got Claims
 	if err := json.Unmarshal(cred, &got); err != nil {
 		return err
@@ -53,8 +54,9 @@ func (e errTest) Error() string { return string(e) }
 // different tiers, and returns a kernel wired to an in-process proposer.
 func issueFixture(t *testing.T) (*Kernel, Session) {
 	t.Helper()
-	s := newStore(t, newSealKey(t))
-	k := New(s, directProposer{s})
+	sl := newSeal(t)
+	s := newStore(t, sl)
+	k := New(s, directProposer{s}, sl)
 	ctx := context.Background()
 
 	rootID, err := k.PutPrincipal(ctx, "", "", "/people/root", "human")
@@ -145,8 +147,9 @@ func TestOnlineOnlyRolesAreNeverEmbedded(t *testing.T) {
 // A session established with the required factor does carry the gated role —
 // the gate is a condition, not a blanket refusal.
 func TestRequiredAMRIsSatisfiable(t *testing.T) {
-	s := newStore(t, newSealKey(t))
-	k := New(s, directProposer{s})
+	sl := newSeal(t)
+	s := newStore(t, sl)
+	k := New(s, directProposer{s}, sl)
 	ctx := context.Background()
 	rootID, _ := k.PutPrincipal(ctx, "", "", "/people/root", "human")
 	if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {
@@ -192,8 +195,9 @@ func TestVerifyAfterSignCatchesAnInventedRole(t *testing.T) {
 // Constraints compose strictest-wins: the shortest applicable ceiling governs,
 // even though rights themselves are additive.
 func TestTTLIsClampedByTheStrictestPolicy(t *testing.T) {
-	s := newStore(t, newSealKey(t))
-	k := New(s, directProposer{s})
+	sl := newSeal(t)
+	s := newStore(t, sl)
+	k := New(s, directProposer{s}, sl)
 	ctx := context.Background()
 	rootID, _ := k.PutPrincipal(ctx, "", "", "/people/root", "human")
 	if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {
@@ -225,8 +229,9 @@ func TestTTLIsClampedByTheStrictestPolicy(t *testing.T) {
 
 // A credential must not outlive the session that authorized it.
 func TestCredentialNeverOutlivesItsSession(t *testing.T) {
-	s := newStore(t, newSealKey(t))
-	k := New(s, directProposer{s})
+	sl := newSeal(t)
+	s := newStore(t, sl)
+	k := New(s, directProposer{s}, sl)
 	ctx := context.Background()
 	rootID, _ := k.PutPrincipal(ctx, "", "", "/people/root", "human")
 	if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {
@@ -252,8 +257,9 @@ func TestCredentialNeverOutlivesItsSession(t *testing.T) {
 // Scope decides which bindings apply: a credential minted for one subtree does
 // not carry roles granted only in a sibling.
 func TestScopeSelectsWhichBindingsApply(t *testing.T) {
-	s := newStore(t, newSealKey(t))
-	k := New(s, directProposer{s})
+	sl := newSeal(t)
+	s := newStore(t, sl)
+	k := New(s, directProposer{s}, sl)
 	ctx := context.Background()
 	rootID, _ := k.PutPrincipal(ctx, "", "", "/people/root", "human")
 	if _, err := k.PutBinding(ctx, "", rootID, "domain-admin", "/", 0); err != nil {

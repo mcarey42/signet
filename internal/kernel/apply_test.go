@@ -8,12 +8,29 @@ import (
 	"testing"
 
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
-func newStore(t *testing.T, keyPath string) *store.Store {
+func newStore(t *testing.T, sl seal.Seal) *store.Store {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "state.db"), store.KeyFileSeal{Path: keyPath})
+	return newStoreWithRoot(t, newRootKey(t, sl))
+}
+
+// newRootKey seals a fresh root key. Tests that compare stored bytes across
+// runs must reuse one, since the barrier is derived from it.
+func newRootKey(t *testing.T, sl seal.Seal) []byte {
+	t.Helper()
+	root, err := seal.LoadOrCreateRootKey(sl, t.TempDir())
+	if err != nil {
+		t.Fatalf("root key: %v", err)
+	}
+	return root
+}
+
+func newStoreWithRoot(t *testing.T, root []byte) *store.Store {
+	t.Helper()
+	s, err := store.Open(filepath.Join(t.TempDir(), "state.db"), root)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -21,13 +38,19 @@ func newStore(t *testing.T, keyPath string) *store.Store {
 	return s
 }
 
-func newSealKey(t *testing.T) string {
+// newSeal builds a file seal over a fresh key, which is what every test that
+// does not specifically exercise hardware uses.
+func newSeal(t *testing.T) seal.Seal {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "seal.key")
-	if err := store.GenerateKeyFile(p); err != nil {
+	if err := seal.GenerateKeyFile(p); err != nil {
 		t.Fatalf("seal key: %v", err)
 	}
-	return p
+	sl, err := seal.OpenFile(p)
+	if err != nil {
+		t.Fatalf("open seal: %v", err)
+	}
+	return sl
 }
 
 // apply runs one Op at a fixed log position, the way the FSM does.
@@ -65,7 +88,9 @@ func bootstrap(t *testing.T, s *store.Store) op.ID {
 // which is exactly what restore does — must reconstruct byte-identical state.
 // This is the test that would catch a stray time.Now() or rand.Read() in Apply.
 func TestApplyIsDeterministicUnderReplay(t *testing.T) {
-	key := newSealKey(t)
+	// One root key for both runs: the barrier is derived from it, so a fresh
+	// key would produce different ciphertext for identical state.
+	root := newRootKey(t, newSeal(t))
 	seq := []op.Op{
 		&op.PutPrincipal{Header: op.Header{AtSec: 10}, ID: "p1", Path: "/people/root", Type: "human"},
 		&op.PutBinding{Header: op.Header{AtSec: 11}, ID: "b1", Subject: "p1", Role: "domain-admin", Scope: "/"},
@@ -75,7 +100,7 @@ func TestApplyIsDeterministicUnderReplay(t *testing.T) {
 	}
 
 	run := func() map[string]map[string][]byte {
-		s := newStore(t, key)
+		s := newStoreWithRoot(t, root)
 		for i, o := range seq {
 			mustApply(t, s, uint64(i+1), o)
 		}
@@ -104,7 +129,7 @@ func TestApplyIsDeterministicUnderReplay(t *testing.T) {
 // scope they were delegated. Randomized over the shape of the tree rather than
 // asserted on a few hand-picked paths.
 func TestDelegationOnlyNarrows(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	root := bootstrap(t, s)
 
 	const delegated = "/clusters/lab"
@@ -155,7 +180,7 @@ func TestDelegationOnlyNarrows(t *testing.T) {
 // own workload at a superior principal — the ESC1 shape, arrived at through
 // authentication config rather than through a grant.
 func TestMappingRulesObeyDelegationNarrows(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	root := bootstrap(t, s)
 
 	mustApply(t, s, 3, &op.PutIssuer{
@@ -202,7 +227,7 @@ func TestMappingRulesObeyDelegationNarrows(t *testing.T) {
 // A mapping must state what it accepts. An empty matcher list matching
 // everything would be an authentication bypass, so it matches nothing.
 func TestMappingRequiresExplicitMatchers(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	root := bootstrap(t, s)
 	mustApply(t, s, 3, &op.PutIssuer{
 		Header: op.Header{Actor: root, AtSec: 1000}, ID: "iss1", Name: "cluster",
@@ -233,7 +258,7 @@ func TestMappingRequiresExplicitMatchers(t *testing.T) {
 // Bootstrap — the one binding with no grantor — is legal exactly once, while
 // the domain holds no bindings at all.
 func TestBootstrapIsSingleUse(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 
 	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "attacker", Path: "/people/attacker", Type: "human"})
@@ -249,7 +274,7 @@ func TestBootstrapIsSingleUse(t *testing.T) {
 // A rejected Op must leave no partial state — this is what lets the FSM commit
 // the audit record for a rejection in the same transaction.
 func TestRejectedOpWritesNothing(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	before, err := s.SnapshotRaw()
 	if err != nil {
@@ -283,7 +308,7 @@ func TestRejectedOpWritesNothing(t *testing.T) {
 // CAS is a state-dependent invariant, so it is checked inside Apply where the
 // serialized single writer makes it race-free.
 func TestSecretVersioningAndCAS(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 
 	if got := mustApply(t, s, 3, &op.PutSecret{Header: op.Header{AtSec: 1}, Path: "/secrets/a", Data: map[string]string{"k": "1"}}).Version; got != 1 {
@@ -309,7 +334,7 @@ func TestSecretVersioningAndCAS(t *testing.T) {
 
 // Authority is evaluated component-wise and honors JIT expiry.
 func TestHasAuthority(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	root := bootstrap(t, s)
 	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "reader", Path: "/people/reader", Type: "service"})
 	mustApply(t, s, 4, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-r", Subject: "reader", Role: "kv-reader", Scope: "/secrets/lab", Grantor: root})

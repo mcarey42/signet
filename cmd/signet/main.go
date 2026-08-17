@@ -35,7 +35,7 @@ import (
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/keys"
 	"github.com/mcarey42/signet/internal/op"
-	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/seal"
 )
 
 const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
@@ -139,7 +139,7 @@ type GenesisConfig struct {
 func cmdGenesis(args []string) error {
 	fs := flag.NewFlagSet("genesis", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "data directory (local disk; never NFS)")
-	sealKey := fs.String("seal-key", "", "seal key file (default DATA-DIR/seal.key; created if absent)")
+	sealKey := fs.String("seal", "", "seal: a key file path, or pkcs11:?module=...&token=...&pin=...&label=... for an HSM (default DATA-DIR/seal.key)")
 	cfgPath := fs.String("config", "", "declarative config to load (JSON)")
 	rootPath := fs.String("root-path", "/people/root", "path of the bootstrap admin principal")
 	ttl := fs.Duration("ttl", 12*time.Hour, "root token lifetime")
@@ -156,19 +156,24 @@ func cmdGenesis(args []string) error {
 	if *dataDir == "" {
 		return errors.New("genesis: -data-dir is required")
 	}
-	keyPath := sealKeyPath(*dataDir, *sealKey)
+	sealCfg := sealURI(*dataDir, *sealKey)
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		return err
 	}
-	if _, err := os.Stat(keyPath); errors.Is(err, os.ErrNotExist) {
-		if err := store.GenerateKeyFile(keyPath); err != nil {
-			return err
+	// Only a file seal has a key to create. A hardware seal's key already
+	// exists inside the device and Signet could not create it if it wanted to —
+	// which is the point.
+	if path, ok := strings.CutPrefix(sealCfg, "file://"); ok {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			if err := seal.GenerateKeyFile(path); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "genesis: wrote seal key %s — back this up; without it the store is unreadable\n", path)
 		}
-		fmt.Fprintf(os.Stderr, "genesis: wrote seal key %s — back this up; without it the store is unreadable\n", keyPath)
 	}
 
-	node, k, err := openNode(*dataDir, keyPath)
+	node, k, err := openNode(*dataDir, sealCfg)
 	if err != nil {
 		return err
 	}
@@ -492,7 +497,7 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 func cmdServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "data directory")
-	sealKey := fs.String("seal-key", "", "seal key file (default DATA-DIR/seal.key)")
+	sealKey := fs.String("seal", "", "seal: a key file path, or a pkcs11: URI for an HSM (default DATA-DIR/seal.key)")
 	listen := fs.String("listen", "127.0.0.1:8200", "listen address")
 	mount := fs.String("mount", "secrets", "KV mount name clients address")
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
@@ -508,7 +513,7 @@ func cmdServe(args []string) error {
 		return errors.New("serve: -data-dir is required")
 	}
 
-	node, k, err := openNode(*dataDir, sealKeyPath(*dataDir, *sealKey))
+	node, k, err := openNode(*dataDir, sealURI(*dataDir, *sealKey))
 	if err != nil {
 		return err
 	}
@@ -553,7 +558,7 @@ func cmdServe(args []string) error {
 func cmdToken(args []string) error {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "data directory")
-	sealKey := fs.String("seal-key", "", "seal key file (default DATA-DIR/seal.key)")
+	sealKey := fs.String("seal", "", "seal: a key file path, or a pkcs11: URI for an HSM (default DATA-DIR/seal.key)")
 	principal := fs.String("principal", "", "principal path to mint a token for")
 	ttl := fs.Duration("ttl", time.Hour, "token lifetime")
 	if err := fs.Parse(args); err != nil {
@@ -562,7 +567,7 @@ func cmdToken(args []string) error {
 	if *dataDir == "" || *principal == "" {
 		return errors.New("token: -data-dir and -principal are required")
 	}
-	node, k, err := openNode(*dataDir, sealKeyPath(*dataDir, *sealKey))
+	node, k, err := openNode(*dataDir, sealURI(*dataDir, *sealKey))
 	if err != nil {
 		return err
 	}
@@ -668,8 +673,8 @@ func doJSON(method, url, token string, body []byte) ([]byte, error) {
 
 // --- shared ---------------------------------------------------------------
 
-func openNode(dataDir, sealKey string) (*fsm.Node, *kernel.Kernel, error) {
-	node, err := fsm.Open(fsm.Config{DataDir: dataDir, SealKey: sealKey})
+func openNode(dataDir, sealURI string) (*fsm.Node, *kernel.Kernel, error) {
+	node, err := fsm.Open(fsm.Config{DataDir: dataDir, Seal: sealURI})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -679,14 +684,22 @@ func openNode(dataDir, sealKey string) (*fsm.Node, *kernel.Kernel, error) {
 		node.Close()
 		return nil, nil, err
 	}
-	return node, kernel.New(node.Store(), node), nil
+	return node, kernel.New(node.Store(), node, node.Seal()), nil
 }
 
-func sealKeyPath(dataDir, override string) string {
-	if override != "" {
+// sealURI resolves the seal configuration. A bare path or an empty value means
+// the default file seal beside the data directory; anything with a scheme is
+// passed through, which is how a hardware seal is selected:
+//
+//	-seal 'pkcs11:?module=/usr/lib/softhsm/libsofthsm2.so&token=signet&pin=1234&label=signet-seal'
+func sealURI(dataDir, override string) string {
+	if override == "" {
+		return "file://" + dataDir + "/seal.key"
+	}
+	if strings.Contains(override, "://") || strings.HasPrefix(override, "pkcs11:") {
 		return override
 	}
-	return dataDir + "/seal.key"
+	return "file://" + override
 }
 
 func envOr(k, def string) string {

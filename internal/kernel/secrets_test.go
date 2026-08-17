@@ -51,7 +51,7 @@ func meta(t *testing.T, s *store.Store, path string) SecretMeta {
 }
 
 func TestSecretVersionHistory(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 
@@ -82,7 +82,7 @@ func TestSecretVersionHistory(t *testing.T) {
 // Soft delete hides a version and can be undone; destroy erases the data and
 // cannot. The distinction is the whole reason both exist.
 func TestSoftDeleteIsReversibleAndDestroyIsNot(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 	mustApply(t, s, 10, &op.PutSecret{Header: op.Header{AtSec: 100}, Path: p, Data: map[string]string{"k": "v1"}})
@@ -119,7 +119,7 @@ func TestSoftDeleteIsReversibleAndDestroyIsNot(t *testing.T) {
 // An empty version list means "the current version" — the shape a plain DELETE
 // on the data path takes.
 func TestDeleteLatestDefaultsToCurrentVersion(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 	mustApply(t, s, 10, &op.PutSecret{Header: op.Header{AtSec: 100}, Path: p, Data: map[string]string{"k": "v1"}})
@@ -137,7 +137,7 @@ func TestDeleteLatestDefaultsToCurrentVersion(t *testing.T) {
 // History is bounded: past max_versions the oldest data is dropped, so a secret
 // cannot grow without limit just by being rewritten.
 func TestMaxVersionsTrimsOldest(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 	mustApply(t, s, 10, &op.PutSecretMeta{Header: op.Header{AtSec: 100}, Path: p, MaxVersions: 3})
@@ -161,7 +161,7 @@ func TestMaxVersionsTrimsOldest(t *testing.T) {
 }
 
 func TestDestroySecretRemovesEverything(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 	mustApply(t, s, 10, &op.PutSecret{Header: op.Header{AtSec: 100}, Path: p, Data: map[string]string{"k": "v1"}})
@@ -186,7 +186,7 @@ func TestDestroySecretRemovesEverything(t *testing.T) {
 }
 
 func TestCASRequiredForcesCallersToDeclareIntent(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
 	mustApply(t, s, 10, &op.PutSecretMeta{Header: op.Header{AtSec: 100}, Path: p, CASRequired: true})
@@ -201,7 +201,7 @@ func TestCASRequiredForcesCallersToDeclareIntent(t *testing.T) {
 }
 
 func TestListReturnsImmediateChildren(t *testing.T) {
-	s := newStore(t, newSealKey(t))
+	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	for i, p := range []string{
 		"/secrets/cluster-svc/apps/litellm",

@@ -29,7 +29,7 @@ func testCA(t *testing.T) *CA {
 		strings.Contains(string(res.Material.IntermediateCertPEM), "PRIVATE KEY") {
 		t.Fatal("a private key leaked into stored certificate material")
 	}
-	c, err := Load(res.Material)
+	c, err := Load(res.Material, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

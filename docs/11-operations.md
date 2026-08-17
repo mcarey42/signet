@@ -77,7 +77,48 @@ wrapper hides them off-box.
   (the diamond-ticket lesson).
 - Prometheus metrics; health endpoints that distinguish "sealed" from "down".
 
-## Open: private keys in the replicated log (raised 2026-08-16)
+## Decided: private keys are sealed before they are proposed (2026-08-16)
+
+Implemented. Private key material — the CA intermediate and every signing key —
+is enclosed in a **seal envelope** before it is ever proposed, so the plaintext
+never enters the Raft log at all, not even in an entry later compacted away.
+What the log holds is a data key wrapped by the seal plus material encrypted
+under that data key. Recovering it requires the seal, which for a hardware seal
+means the device.
+
+The barrier still protects everything on top; the envelope is what makes the
+barrier insufficient on its own. `Apply` refuses a key record that arrives with
+plaintext material, so the property is enforced at the write path rather than
+trusted to callers.
+
+**Seals are pluggable and the interface is the same either way:**
+
+- `file:///path/to/seal.key` — the default. Defends against a stolen backup or
+  a leaked store file, not against someone who owns the host.
+- `pkcs11:?module=…&token=…&pin=…&label=…` — an HSM. Wrap and unwrap happen
+  *inside the device*; the wrapping key is never readable, so a compromise of
+  Signet's memory, disk, or backups yields the ability to ask the HSM to work
+  while the process runs, not the key itself (E-01 DB-3's "key use during
+  uptime, not key exfiltration").
+
+The barrier root key is generated once, wrapped by the seal, and only ever
+written in wrapped form (`root.seal`). A data directory therefore cannot be
+opened by anything but the seal that created it — verified: substituting a file
+seal for the HSM fails with the wrapping key's identity, and removing the token
+stops the domain from starting rather than letting it come up degraded.
+
+PKCS#11 requires cgo, so it lives behind a `pkcs11` build tag; the default
+binary stays static and pure-Go (docs/09). A build without the tag **refuses** a
+configured hardware seal rather than falling back, because a domain that
+believes its keys are in an HSM and is wrong is worse off than one that will not
+start. `make test-hsm` provisions a SoftHSM token and runs the seal tests
+against it — the same code path a real HSM takes.
+
+Still open: rotating the seal itself (unwrap under the old, rewrap under the
+new) is a ceremony that has not been built yet, and the per-subtree DEKs for KV
+values remain future work.
+
+## Superseded: the original question (raised 2026-08-16)
 
 Today `PutCA` and `PutKey` carry **private key material** through Raft into
 state.db, barrier-encrypted. Public certificates belong there — they are

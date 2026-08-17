@@ -13,6 +13,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/attest"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
@@ -37,12 +38,19 @@ type Kernel struct {
 	store     *store.Store
 	prop      Proposer
 	verifiers *attest.Registry
+	seal      seal.Seal
 	now       func() time.Time
 }
 
-func New(s *store.Store, p Proposer) *Kernel {
-	return &Kernel{store: s, prop: p, verifiers: attest.Default(), now: time.Now}
+// New builds a kernel. The seal is what opens sealed private key material; a
+// kernel without one can still serve secrets and policy, but cannot sign.
+func New(s *store.Store, p Proposer, sl seal.Seal) *Kernel {
+	return &Kernel{store: s, prop: p, verifiers: attest.Default(), seal: sl, now: time.Now}
 }
+
+// Seal exposes the seal for the few callers that must open sealed material
+// themselves, such as a dialect publishing a public key set.
+func (k *Kernel) Seal() seal.Seal { return k.seal }
 
 // SetClock is for tests only.
 func (k *Kernel) SetClock(f func() time.Time) { k.now = f }

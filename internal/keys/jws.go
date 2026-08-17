@@ -11,13 +11,15 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+
+	"github.com/mcarey42/signet/internal/seal"
 )
 
 // SignJWS produces a compact JWS over the claims, using the key's own algorithm
 // rather than anything a caller supplies. That is the same rule the verifier in
 // internal/attest follows from the other side: the algorithm is a property of
 // the key, never of the message.
-func (k *Key) SignJWS(claims any) (string, error) {
+func (k *Key) SignJWS(sl seal.Seal, claims any) (string, error) {
 	if k.Purpose != PurposeToken {
 		return "", fmt.Errorf("keys: %s keys do not sign tokens", k.Purpose)
 	}
@@ -33,7 +35,7 @@ func (k *Key) SignJWS(claims any) (string, error) {
 	}
 	signing := b64(header) + "." + b64(payload)
 
-	signer, err := k.Signer()
+	signer, err := k.Signer(sl)
 	if err != nil {
 		return "", err
 	}
@@ -67,12 +69,12 @@ func (k *Key) SignJWS(claims any) (string, error) {
 // credential is released to the world and cannot be recalled, so the cheapest
 // possible moment to catch a malformed one is immediately after making it
 // (charter principle 6).
-func (k *Key) VerifyJWSSelf(token string) error {
+func (k *Key) VerifyJWSSelf(sl seal.Seal, token string) error {
 	parts := splitN(token, '.', 3)
 	if len(parts) != 3 {
 		return errors.New("self-verify: malformed token")
 	}
-	pub, err := k.Public()
+	pub, err := k.Public(sl)
 	if err != nil {
 		return err
 	}

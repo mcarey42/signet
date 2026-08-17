@@ -23,6 +23,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/keys"
+	"github.com/mcarey42/signet/internal/seal"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -52,7 +53,7 @@ type Serializer struct {
 	Request Request
 }
 
-func (s *Serializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
+func (s *Serializer) Serialize(c kernel.Claims, k *keys.Key, sl seal.Seal) ([]byte, error) {
 	if k.Purpose != keys.PurposeSSH {
 		return nil, fmt.Errorf("sshca: cannot sign with a %s key", k.Purpose)
 	}
@@ -83,7 +84,7 @@ func (s *Serializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
 		},
 	}
 
-	signer, err := k.Signer()
+	signer, err := k.Signer(sl)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +101,7 @@ func (s *Serializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
 // Verify re-parses the certificate from its own bytes and re-checks it against
 // the role — the same rules, applied to what was actually produced rather than
 // to what was intended (charter principle 6).
-func (s *Serializer) Verify(cred []byte, c kernel.Claims, k *keys.Key) error {
+func (s *Serializer) Verify(cred []byte, c kernel.Claims, k *keys.Key, sl seal.Seal) error {
 	pub, _, _, _, err := ssh.ParseAuthorizedKey(cred)
 	if err != nil {
 		return fmt.Errorf("re-parse: %w", err)
@@ -139,7 +140,7 @@ func (s *Serializer) Verify(cred []byte, c kernel.Claims, k *keys.Key) error {
 		}
 	}
 	// The certificate must verify under the CA key that signed it.
-	pubKey, err := k.Public()
+	pubKey, err := k.Public(sl)
 	if err != nil {
 		return err
 	}
@@ -230,8 +231,8 @@ func sortStrings(s []string) {
 
 // CAPublicKey renders the CA's public half in authorized_keys form, which is
 // what a host puts in TrustedUserCAKeys.
-func CAPublicKey(k *keys.Key) ([]byte, error) {
-	pub, err := k.Public()
+func CAPublicKey(k *keys.Key, sl seal.Seal) ([]byte, error) {
+	pub, err := k.Public(sl)
 	if err != nil {
 		return nil, err
 	}

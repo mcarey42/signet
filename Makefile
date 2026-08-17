@@ -40,3 +40,36 @@ tidy: $(BUILD_DIR)
 
 clean:
 	@rm -rf $(BUILD_DIR)
+
+# Hardware-seal tests against a SoftHSM token. SoftHSM implements the same
+# PKCS#11 interface a real HSM does, so this exercises the production code path
+# rather than a mock. Requires cgo and the pkcs11 build tag.
+SOFTHSM_MODULE ?= /opt/homebrew/lib/softhsm/libsofthsm2.so
+# Deliberately outside BUILD_DIR: the build mirror is rsynced with --delete,
+# which would wipe the token between creating it and using it.
+SOFTHSM_DIR    ?= $(TMPDIR)signet-softhsm
+
+.PHONY: softhsm test-hsm build-hsm
+
+softhsm:
+	@rm -rf $(SOFTHSM_DIR) && mkdir -p $(SOFTHSM_DIR)/tokens
+	@printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$(SOFTHSM_DIR)" > $(SOFTHSM_DIR)/softhsm2.conf
+	@SOFTHSM2_CONF=$(SOFTHSM_DIR)/softhsm2.conf softhsm2-util --init-token --free \
+		--label signet --pin 1234 --so-pin 5678 >/dev/null
+	@SOFTHSM2_CONF=$(SOFTHSM_DIR)/softhsm2.conf pkcs11-tool --module $(SOFTHSM_MODULE) \
+		--login --pin 1234 --keygen --key-type aes:32 --label signet-seal --usage-decrypt >/dev/null 2>&1
+	@echo "token ready: $(SOFTHSM_DIR)/softhsm2.conf"
+
+test-hsm: $(BUILD_DIR) softhsm
+	@$(SYNC)
+	@cd $(BUILD_DIR) && CGO_ENABLED=1 \
+		SOFTHSM2_CONF=$(SOFTHSM_DIR)/softhsm2.conf \
+		SIGNET_TEST_PKCS11='pkcs11:?module=$(SOFTHSM_MODULE)&token=signet&pin=1234&label=signet-seal' \
+		go test -tags pkcs11 ./internal/seal/
+
+# A binary with hardware-seal support. Needs cgo, so it is not the static
+# default build.
+build-hsm: $(BUILD_DIR)
+	@$(SYNC)
+	@cd $(BUILD_DIR) && CGO_ENABLED=1 go build -tags pkcs11 -o signet-hsm ./cmd/signet
+	@echo "built $(BUILD_DIR)/signet-hsm"

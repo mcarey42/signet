@@ -30,15 +30,58 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/mcarey42/signet/internal/seal"
 )
 
-// Material is a CA's persistable form. The intermediate's private key is the
-// only key here; it lives in the store under the barrier, and moving it into a
-// TPM, PKCS#11 token, or cloud KMS is the hardening milestone's job (E-01 DB-3).
+// Material is a CA's persistable form.
+//
+// Certificates are public and belong in the replicated log — every replica
+// needs them and they are published anyway. The intermediate's private key is
+// different: it is enclosed in a seal envelope, so what reaches the log is
+// ciphertext the barrier alone cannot open. Without that, rotating the
+// intermediate would not help, because the log is append-only and its backups
+// are immutable — the old key would remain readable forever to anyone who ever
+// obtained the barrier key (docs/11).
 type Material struct {
-	RootCertPEM         []byte `json:"root_cert"`
-	IntermediateCertPEM []byte `json:"intermediate_cert"`
-	IntermediateKeyPEM  []byte `json:"intermediate_key"`
+	RootCertPEM         []byte         `json:"root_cert"`
+	IntermediateCertPEM []byte         `json:"intermediate_cert"`
+	IntermediateKeyPEM  []byte         `json:"intermediate_key,omitempty"` // in-memory only
+	SealedKey           *seal.Envelope `json:"sealed_key,omitempty"`       // the stored form
+}
+
+const caKeyAAD = "signet/ca/intermediate/v1"
+
+// Seal encloses the intermediate key and drops the plaintext, returning the
+// form that may be persisted.
+func (m Material) Seal(s seal.Seal) (Material, error) {
+	if m.SealedKey != nil {
+		return m, nil
+	}
+	if len(m.IntermediateKeyPEM) == 0 {
+		return m, errors.New("ca: no intermediate key to seal")
+	}
+	env, err := seal.NewEnvelope(s, m.IntermediateKeyPEM, []byte(caKeyAAD))
+	if err != nil {
+		return m, err
+	}
+	m.SealedKey = env
+	m.IntermediateKeyPEM = nil
+	return m, nil
+}
+
+// intermediateKey recovers the private half, which requires the seal.
+func (m Material) intermediateKey(s seal.Seal) ([]byte, error) {
+	if m.SealedKey == nil {
+		if len(m.IntermediateKeyPEM) == 0 {
+			return nil, errors.New("ca: material has no intermediate key")
+		}
+		return m.IntermediateKeyPEM, nil
+	}
+	if s == nil {
+		return nil, errors.New("ca: intermediate key is sealed and no seal was provided")
+	}
+	return m.SealedKey.Open(s, []byte(caKeyAAD))
 }
 
 // CA is a loaded, ready-to-sign authority.
@@ -167,8 +210,10 @@ func Genesis(commonName string, permittedDNS []string, permittedIPs []*net.IPNet
 	}, nil
 }
 
-// Load parses stored material into a usable authority.
-func Load(m Material) (*CA, error) {
+// Load parses stored material into a usable authority. The seal is needed to
+// open the intermediate key; pass nil to load only the public half, which is
+// enough to validate material without being able to sign with it.
+func Load(m Material, s seal.Seal) (*CA, error) {
 	root, err := parseCert(m.RootCertPEM)
 	if err != nil {
 		return nil, fmt.Errorf("ca: root: %w", err)
@@ -177,7 +222,17 @@ func Load(m Material) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ca: intermediate: %w", err)
 	}
-	blk, _ := pem.Decode(m.IntermediateKeyPEM)
+	loaded := &CA{root: root, intermediate: inter, material: m}
+	if s == nil && m.SealedKey != nil {
+		// Public-only load: the authority can be inspected and its chain
+		// published, but nothing can be signed with it.
+		return loaded, nil
+	}
+	material, err := m.intermediateKey(s)
+	if err != nil {
+		return nil, err
+	}
+	blk, _ := pem.Decode(material)
 	if blk == nil {
 		return nil, errors.New("ca: intermediate key is not PEM")
 	}
@@ -185,7 +240,8 @@ func Load(m Material) (*CA, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ca: intermediate key: %w", err)
 	}
-	return &CA{root: root, intermediate: inter, key: key, material: m}, nil
+	loaded.key = key
+	return loaded, nil
 }
 
 func (c *CA) RootPEM() []byte { return c.material.RootCertPEM }
@@ -220,6 +276,9 @@ type Issued struct {
 // Sign validates a request against a role, issues a certificate, and refuses to
 // return it unless an independent verification pass agrees it should exist.
 func (c *CA) Sign(req Request, role Role, serial *big.Int, now time.Time) (*Issued, error) {
+	if c.key == nil {
+		return nil, errors.New("ca: this authority was loaded without its key and cannot sign")
+	}
 	csr, err := parseCSR(req.CSRPEM)
 	if err != nil {
 		return nil, err

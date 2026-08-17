@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	github.com/miekg/pkcs11 v1.1.2
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/crypto v0.55.0
 )

@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,7 +21,16 @@ type Barrier struct {
 	key  []byte
 }
 
-func NewBarrier(key []byte) (*Barrier, error) {
+const barrierInfo = "signet/barrier/v1"
+
+// NewBarrier derives the at-rest key from the seal-held root key. Deriving
+// rather than using the root directly means the same root can protect other
+// things later without those uses sharing a key.
+func NewBarrier(rootKey []byte) (*Barrier, error) {
+	key, err := hkdf.Key(sha256.New, rootKey, nil, barrierInfo, 32)
+	if err != nil {
+		return nil, err
+	}
 	blk, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err

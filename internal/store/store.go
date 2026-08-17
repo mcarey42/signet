@@ -47,12 +47,12 @@ type Store struct {
 	b  *Barrier
 }
 
-func Open(path string, seal Seal) (*Store, error) {
-	key, err := seal.BarrierKey()
-	if err != nil {
-		return nil, err
-	}
-	b, err := NewBarrier(key)
+// Open attaches to a store, deriving the barrier from a root key the caller
+// obtained from the seal. The store deliberately knows nothing about seals:
+// persistence and key custody are separate concerns, and keeping them apart is
+// what let a hardware seal drop in without touching this file.
+func Open(path string, rootKey []byte) (*Store, error) {
+	b, err := NewBarrier(rootKey)
 	if err != nil {
 		return nil, err
 	}

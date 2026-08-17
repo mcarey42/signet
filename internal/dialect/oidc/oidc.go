@@ -19,6 +19,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/keys"
+	"github.com/mcarey42/signet/internal/seal"
 )
 
 const (
@@ -80,7 +81,7 @@ func (h *Handler) jwks(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(ks))
 	for _, k := range ks {
-		jwk, err := k.JWK()
+		jwk, err := k.JWK(h.k.Seal())
 		if err != nil {
 			continue
 		}
@@ -163,7 +164,7 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 // property of the data it is handed rather than a rule it must remember.
 type jwtSerializer struct{}
 
-func (jwtSerializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
+func (jwtSerializer) Serialize(c kernel.Claims, k *keys.Key, sl seal.Seal) ([]byte, error) {
 	claims := map[string]any{
 		"iss": c.Issuer, "sub": c.Subject, "aud": c.Audience,
 		"exp": c.ExpirySec, "iat": c.IssuedSec, "nbf": c.NotBefore,
@@ -180,7 +181,7 @@ func (jwtSerializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
 			claims[k] = v
 		}
 	}
-	token, err := k.SignJWS(claims)
+	token, err := k.SignJWS(sl, claims)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +192,8 @@ func (jwtSerializer) Serialize(c kernel.Claims, k *keys.Key) ([]byte, error) {
 // is what was meant to go in — signature, issuer, audience, lifetime, and the
 // exact role set the filter produced. An extra role here would mean the
 // serializer invented one.
-func (jwtSerializer) Verify(cred []byte, c kernel.Claims, k *keys.Key) error {
-	if err := k.VerifyJWSSelf(string(cred)); err != nil {
+func (jwtSerializer) Verify(cred []byte, c kernel.Claims, k *keys.Key, sl seal.Seal) error {
+	if err := k.VerifyJWSSelf(sl, string(cred)); err != nil {
 		return err
 	}
 	parts := strings.Split(string(cred), ".")

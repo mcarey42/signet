@@ -10,6 +10,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/ca"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
 
@@ -31,11 +32,15 @@ func applyPutCA(tx *store.Tx, o *op.PutCA) op.Result {
 	if err := json.Unmarshal(o.Material, &m); err != nil {
 		return op.Result{Err: fmt.Errorf("ca: material: %w", err)}
 	}
-	// Refuse to store anything that is not a loadable authority, and refuse
-	// outright if a root private key was included — that must never reach the
-	// log, and catching it here is cheaper than discovering it in a backup.
-	if _, err := ca.Load(m); err != nil {
+	// Refuse to store anything that is not a loadable authority. This is the
+	// public-only load: Apply must stay deterministic and has no seal, which is
+	// exactly right — validating the material never requires opening its key.
+	if _, err := ca.Load(m, nil); err != nil {
 		return op.Result{Err: err}
+	}
+	// The private half must already be sealed before it reaches the log.
+	if len(m.IntermediateKeyPEM) != 0 {
+		return op.Result{Err: errors.New("ca: refusing plaintext intermediate key; material must be sealed before it is proposed")}
 	}
 	if err := tx.Put(store.BucketCA, o.Name, o.Material); err != nil {
 		return op.Result{Err: err}
@@ -109,7 +114,13 @@ type IssuanceRecord struct {
 
 // InstallCA stores a CA created by the genesis ceremony.
 func (k *Kernel) InstallCA(ctx context.Context, grantor op.ID, name string, m ca.Material) error {
-	blob, err := json.Marshal(m)
+	// Seal at propose time, so the plaintext key never enters the log at all —
+	// not even in an entry that is later compacted away.
+	sealed, err := m.Seal(k.seal)
+	if err != nil {
+		return err
+	}
+	blob, err := json.Marshal(sealed)
 	if err != nil {
 		return err
 	}
@@ -130,7 +141,8 @@ func (k *Kernel) PutPKIRole(ctx context.Context, grantor op.ID, role ca.Role) er
 // CAChain returns the trust material clients need, which is public by design.
 func (k *Kernel) CAChain(ctx context.Context, name string) (root, chain []byte, err error) {
 	err = k.store.View(func(tx *store.Tx) error {
-		authority, err := loadCA(tx, name)
+		// Public-only: publishing a chain does not require the signing key.
+		authority, err := loadCA(tx, name, nil)
 		if err != nil {
 			return err
 		}
@@ -170,7 +182,7 @@ func (k *Kernel) SignCertificate(ctx context.Context, s Session, caName, roleNam
 		if !allowed {
 			return ErrDenied
 		}
-		authority, err = loadCA(tx, caName)
+		authority, err = loadCA(tx, caName, k.seal)
 		return err
 	}); err != nil {
 		return nil, err
@@ -197,7 +209,7 @@ func (k *Kernel) SignCertificate(ctx context.Context, s Session, caName, roleNam
 	return issued, nil
 }
 
-func loadCA(tx *store.Tx, name string) (*ca.CA, error) {
+func loadCA(tx *store.Tx, name string, sl seal.Seal) (*ca.CA, error) {
 	raw, ok, err := tx.Get(store.BucketCA, name)
 	if err != nil {
 		return nil, err
@@ -209,7 +221,7 @@ func loadCA(tx *store.Tx, name string) (*ca.CA, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
-	return ca.Load(m)
+	return ca.Load(m, sl)
 }
 
 // IssuanceLog returns recorded issuances, newest serials last. It is an

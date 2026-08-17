@@ -15,7 +15,7 @@ import (
 	"github.com/mcarey42/signet/internal/dialect/vaultkv"
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
-	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/seal"
 )
 
 const testMount = "secrets-home-solcore-dot-net"
@@ -28,10 +28,10 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "seal.key")
-	if err := store.GenerateKeyFile(keyPath); err != nil {
+	if err := seal.GenerateKeyFile(keyPath); err != nil {
 		t.Fatal(err)
 	}
-	node, err := fsm.Open(fsm.Config{DataDir: filepath.Join(dir, "data"), SealKey: keyPath})
+	node, err := fsm.Open(fsm.Config{DataDir: filepath.Join(dir, "data"), Seal: "file://" + keyPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 		t.Fatal(err)
 	}
 
-	k := kernel.New(node.Store(), node)
+	k := kernel.New(node.Store(), node, node.Seal())
 	rootID, err := k.PutPrincipal(ctx, "", "", "/people/root", "human")
 	if err != nil {
 		t.Fatal(err)
