@@ -120,6 +120,12 @@ func (n *Node) Store() *store.Store { return n.st }
 func (n *Node) Seal() seal.Seal { return n.seal }
 
 // WaitForLeader blocks until this node has won its (uncontested) election.
+//
+// If it never does, the most common cause by far is a node restarted under a
+// different identity than it bootstrapped with: Raft's stored configuration
+// names the original, so the node is absent from its own cluster and cannot
+// vote for itself. That is reported here rather than left as a timeout, because
+// a hang gives an operator nothing to act on.
 func (n *Node) WaitForLeader(ctx context.Context) error {
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
@@ -129,7 +135,12 @@ func (n *Node) WaitForLeader(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("fsm: no leader: %w", ctx.Err())
+			return fmt.Errorf(
+				"fsm: node %q never became leader: %w.\n"+
+					"If this domain previously ran under a different node name, that is the cause: "+
+					"Raft's stored configuration names the original, so this node is not a member of "+
+					"its own cluster and cannot elect itself. Restart it under the name it was "+
+					"created with", n.id, ctx.Err())
 		case <-tick.C:
 		}
 	}

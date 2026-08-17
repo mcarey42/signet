@@ -43,7 +43,10 @@ type Config struct {
 	// "pki-home-solcore-dot-net". Empty disables the PKI routes.
 	PKIMount string
 	CAName   string
-	Status   func() Status
+	// NodeID selects this node's own issuing authority when the domain has
+	// several. Falls back to the shared authority when it has none.
+	NodeID string
+	Status func() Status
 }
 
 type Handler struct {
@@ -57,6 +60,9 @@ func New(k *kernel.Kernel, cfg Config) *Handler {
 	}
 	if cfg.CAName == "" {
 		cfg.CAName = "default"
+	}
+	if cfg.NodeID == "" {
+		cfg.NodeID = "signet-0"
 	}
 	return &Handler{k: k, cfg: cfg}
 }

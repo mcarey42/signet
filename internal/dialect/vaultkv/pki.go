@@ -55,7 +55,14 @@ func (h *Handler) signCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	issued, err := h.k.SignCertificate(r.Context(), s, h.cfg.CAName, r.PathValue("role"), ca.Request{
+	// Sign with this node's own issuing authority when it has one, so a domain
+	// with several signing nodes uses the key each node actually holds.
+	authority, err := h.k.SigningAuthority(r.Context(), h.cfg.NodeID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	issued, err := h.k.SignCertificate(r.Context(), s, authority, r.PathValue("role"), ca.Request{
 		CSRPEM:            []byte(csr),
 		CommonName:        str(body["common_name"]),
 		DNSNames:          csv(str(body["alt_names"])),
@@ -92,7 +99,12 @@ func (h *Handler) signCertificate(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) caPEM(chain bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		root, full, err := h.k.CAChain(r.Context(), h.cfg.CAName)
+		authority, err := h.k.SigningAuthority(r.Context(), h.cfg.NodeID)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "no certificate authority configured")
+			return
+		}
+		root, full, err := h.k.CAChain(r.Context(), authority)
 		if err != nil {
 			writeErr(w, http.StatusNotFound, "no certificate authority configured")
 			return

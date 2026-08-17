@@ -213,6 +213,56 @@ func (k *Kernel) SignCertificate(ctx context.Context, s Session, caName, roleNam
 	return issued, nil
 }
 
+// IssuerName is how a node's own issuing authority is keyed. Several nodes in
+// one domain each store their own, so a node signs with the key it holds rather
+// than one shared through the log (docs/02).
+func IssuerName(nodeID string) string { return "issuer/" + nodeID }
+
+// SigningAuthority picks the authority this node should sign with: its own
+// issuer if it has one, otherwise the shared "default" authority.
+//
+// The fallback is not a compatibility shim — a single-node domain, or one that
+// deliberately replicates a single sealed issuing key, is a perfectly good
+// configuration. Per-node issuers are what a domain chooses when it wants
+// heterogeneous custody or independent failure.
+func (k *Kernel) SigningAuthority(ctx context.Context, nodeID string) (string, error) {
+	name := IssuerName(nodeID)
+	err := k.store.View(func(tx *store.Tx) error {
+		if _, ok, err := tx.Get(store.BucketCA, name); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+		if _, ok, err := tx.Get(store.BucketCA, "default"); err != nil {
+			return err
+		} else if ok {
+			name = "default"
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: this domain has no certificate authority. Node %q has no issuer of its own "+
+				"(%s) and there is no shared authority. Run the root ceremony, or request and "+
+				"install an issuer for this node", ErrNotFound, nodeID, name)
+	})
+	return name, err
+}
+
+// Issuers lists every issuing authority in this domain, which is what an
+// operator needs to see when reasoning about who can sign and with what custody.
+func (k *Kernel) Issuers(ctx context.Context) (map[string]ca.Material, error) {
+	out := map[string]ca.Material{}
+	err := k.store.View(func(tx *store.Tx) error {
+		return tx.ScanPrefix(store.BucketCA, "", func(name string, val []byte) bool {
+			var m ca.Material
+			if json.Unmarshal(val, &m) == nil {
+				out[name] = m
+			}
+			return true
+		})
+	})
+	return out, err
+}
+
 func loadCA(tx *store.Tx, name string, sl seal.Seal) (*ca.CA, error) {
 	raw, ok, err := tx.Get(store.BucketCA, name)
 	if err != nil {

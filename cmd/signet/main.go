@@ -47,6 +47,7 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet kv put   -addr URL -token T PATH k=v    write a secret over the API
   signet seal status -data-dir DIR               show which seal holds the keys
   signet seal rotate -data-dir DIR -to URI       move key custody to another seal
+  signet ca ...                                  CA ceremonies (see: signet ca help)
 `
 
 func main() {
@@ -66,6 +67,8 @@ func main() {
 		err = cmdKV(os.Args[2:])
 	case "seal":
 		err = cmdSeal(os.Args[2:])
+	case "ca":
+		err = cmdCA(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -199,6 +202,14 @@ func cmdGenesis(args []string) error {
 	if existing, err := k.PrincipalByPath(ctx, *rootPath); err == nil {
 		rootID = existing.ID
 		fmt.Fprintf(os.Stderr, "genesis: domain already initialized (root %s)\n", rootID)
+		if *cfgPath != "" {
+			// Silently ignoring the config would be worse than refusing it: an
+			// operator who passes -config expects it to have been applied.
+			fmt.Fprintf(os.Stderr,
+				"genesis: NOT loading %s — declarative config is applied only when a domain is\n"+
+					"         first created, and re-applying it here could duplicate bindings.\n"+
+					"         Apply changes to a running domain through the API instead.\n", *cfgPath)
+		}
 	} else {
 		if rootID, err = k.PutPrincipal(ctx, "", "", *rootPath, "human"); err != nil {
 			return fmt.Errorf("genesis: create root principal: %w", err)
@@ -551,6 +562,7 @@ func cmdServe(args []string) error {
 	listen := fs.String("listen", "127.0.0.1:8200", "listen address")
 	mount := fs.String("mount", "secrets", "KV mount name clients address")
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
+	nodeID := fs.String("node-id", "", "which issuing authority is this node's own, when the domain has several (see `signet ca issuers`); not the consensus identity")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
 	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
@@ -574,6 +586,7 @@ func cmdServe(args []string) error {
 		TreePrefix: *prefix,
 		PKIMount:   *pkiMount,
 		CAName:     "default",
+		NodeID:     *nodeID,
 		Status: func() vaultkv.Status {
 			s := node.Status()
 			return vaultkv.Status{Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader}
@@ -877,6 +890,14 @@ func doJSON(method, url, token string, body []byte) ([]byte, error) {
 
 // --- shared ---------------------------------------------------------------
 
+// openNode attaches to a domain.
+//
+// Note what is deliberately absent: the node's *consensus* identity is not
+// configurable here. Raft records the identity a node bootstrapped with in its
+// own configuration, so changing it later would leave the node absent from its
+// own cluster and unable to elect itself — it would simply hang. Issuer
+// selection uses a separate name (-node-id) that has nothing to do with
+// consensus.
 func openNode(dataDir, sealURI string) (*fsm.Node, *kernel.Kernel, error) {
 	node, err := fsm.Open(fsm.Config{DataDir: dataDir, Seal: sealURI})
 	if err != nil {
@@ -905,6 +926,9 @@ func sealURI(dataDir, override string) string {
 	}
 	return "file://" + override
 }
+
+func jsonMarshal(v any) ([]byte, error)   { return json.MarshalIndent(v, "", "  ") }
+func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
