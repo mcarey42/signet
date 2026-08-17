@@ -161,6 +161,117 @@ this. Therefore:
   cost of offline/partition-tolerant parent re-issue. A deliberate trade for a
   genuinely adversarial parent.
 
+## Anchors, issuers, and the two trust flows (Decided 2026-08-16)
+
+Three separable decisions get conflated whenever someone says "the root CA".
+Keeping them apart is what makes the rest of this document tractable.
+
+### 1. A trust anchor is a role, not a property of a certificate
+
+"Root" means *self-signed and installed in a trust store*. An intermediate
+installed in a trust store **is** a root from that verifier's point of view: the
+verifier walks up from the leaf, finds its anchor partway, and stops. It never
+needs the certificate above.
+
+That gives a spectrum, and every point on it is legitimate:
+
+| Anchor the client holds | Can the parent impersonate this subtree? | Cost of rotating the subtree's CA |
+|---|---|---|
+| **Org root** (cascade) | Yes, freely — it holds the key above | Free: intermediates come and go beneath the anchor |
+| **The subtree's own intermediate** (pinned) | **No, for clients that pinned it** | Those clients must be updated |
+| **The subtree's own root** (sovereign) | No, ever — there is no key above | Entirely local |
+
+The middle row is worth stating precisely because it is stronger than it looks.
+A client anchored on intermediate `I_A` rejects a leaf from sibling `I_B` (the
+chain never reaches its anchor) *and* rejects a parent-minted replacement `I_A′`
+carrying the same subject and constraints, because an anchor is a specific
+public key and `I_A′`'s signature will not verify against it. This is the
+child-intermediate pinning offered as a DB-1 mitigation, and for pinning clients
+it is preventive rather than merely detective.
+
+What it costs is the indirection the root existed to provide. Anchoring on the
+root lets intermediates rotate freely; anchoring on an intermediate means
+rotation touches every pinning client. That trade — **isolation bought with
+rotation cost** — is the whole decision.
+
+Name constraints remain complementary rather than redundant: constraints bound
+what a subtree may *claim* (enforced for root-trusting clients), pinning bounds
+what a client will *accept*. Different directions, both worth having.
+
+### 2. One CA identity, several issuers
+
+Each domain level runs **three issuing intermediates**, one per signing node,
+all signed by the same root. No private key is ever copied between nodes:
+
+```
+              root  (offline, durable, used a few times a decade)
+                |
+   +------------+------------+
+   |            |            |
+issuer A     issuer B     issuer C        <- one per node, own key, own custody
+ (HSM)     (cloud KMS)   (file seal)
+```
+
+The provisioning flow is the same regardless of custody: the node generates its
+key *where that key will live*, emits a CSR, the offline root signs it, and the
+resulting certificate is installed. **The root key never touches the node**,
+which is what makes heterogeneous custody routine rather than a special case —
+a cloud HSM, a PKCS#11 token, and a file seal can all be issuers of one chain.
+
+Why this rather than replicating one issuing key (Vault's model, and Signet's
+own simple default):
+
+- **Heterogeneous custody becomes possible at all.** A replicated key must live
+  in shared storage; it cannot simultaneously be non-extractable in three
+  different devices.
+- **Failure is already partial.** Losing a node's HSM costs that node. The
+  others were always issuing; there is nothing to fail over.
+- **Revocation is granular.** Compromise of a node revokes one intermediate,
+  not the chain.
+- **Certificates are attributable.** The chain names which issuer — and
+  therefore which custody — produced them.
+
+The cost is provisioning: three ceremonies instead of none, and three
+intermediates to rotate. Replicating a single sealed issuing key remains the
+right default for simple deployments; per-node issuers are what a domain that
+cares about custody or blast radius chooses.
+
+### 3. Cascade and sovereign are two flows over the same machinery
+
+**Cascade** (default, intra-org): the org root signs each domain's issuers.
+Clients anchor on the org root, so a new domain or a rotated issuer requires no
+client change — the anchor above absorbs it. The parent is legitimately
+all-powerful, which is what a single organization's hierarchy means.
+
+**Sovereign**: the domain holds its own root, and the parent's involvement is a
+cross-certificate for discovery rather than authority. Clients that must not be
+impersonable by the parent anchor on the domain's own root. Issuers below it
+work exactly as in cascade — the difference is only which certificate sits at
+the top and who holds the key for it.
+
+The practical middle — cascade internally, pinned intermediates for a subset of
+clients — needs no new mechanism, only a different anchor in those clients'
+bundles.
+
+### 4. What the trust bundle therefore carries
+
+Anchor selection is **configuration in a signed artifact**, not a
+re-installation exercise. A bundle names, and the root signs:
+
+- the anchors this consumer should trust — an org root, one or more specific
+  issuer intermediates, or a sovereign domain's own root;
+- the **full issuer set** for each anchor, so a verifier can build paths without
+  discovery;
+- **revocation state** (CRL, or the epoch of a revocation list), so withdrawing
+  one compromised issuer is a bundle update rather than a fleet-wide change;
+- metadata: epoch, issued-at, max-age, and the algorithm policy (crypto-agility
+  below).
+
+That makes "trust only this domain and below" a line of configuration, and
+makes rotating a pinned intermediate a publish-ahead-then-retire operation on
+the same refresh path everything else already uses. Bundle mechanics, epochs,
+and staleness rules are E-12.
+
 ## Crypto-agility: PQC-hedged composite roots (Decided)
 
 The trust anchor is **crypto-agile from day one** so an algorithm can be
