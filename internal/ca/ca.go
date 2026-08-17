@@ -47,7 +47,16 @@ type Material struct {
 	RootCertPEM         []byte         `json:"root_cert"`
 	IntermediateCertPEM []byte         `json:"intermediate_cert"`
 	IntermediateKeyPEM  []byte         `json:"intermediate_key,omitempty"` // in-memory only
-	SealedKey           *seal.Envelope `json:"sealed_key,omitempty"`       // the stored form
+	SealedKey           *seal.Envelope `json:"sealed_key,omitempty"`       // wrapped at rest
+	// IntermediateRef points at a key held inside a token. When set, no private
+	// material exists anywhere outside the device — not in the log, not in a
+	// backup, not in this process. Signing happens in the token.
+	IntermediateRef *seal.KeyRef `json:"intermediate_ref,omitempty"`
+	// RootRef records where the root key lives when it too is held in hardware.
+	// Signet never uses it to sign — the root signs intermediates during a
+	// ceremony, not certificates — but recording it means a future ceremony can
+	// find the key instead of hunting for a file.
+	RootRef *seal.KeyRef `json:"root_ref,omitempty"`
 }
 
 const caKeyAAD = "signet/ca/intermediate/v1"
@@ -55,6 +64,10 @@ const caKeyAAD = "signet/ca/intermediate/v1"
 // Seal encloses the intermediate key and drops the plaintext, returning the
 // form that may be persisted.
 func (m Material) Seal(s seal.Seal) (Material, error) {
+	// A key held in hardware has nothing to seal: there is no material.
+	if m.IntermediateRef != nil {
+		return m, nil
+	}
 	if m.SealedKey != nil {
 		return m, nil
 	}
@@ -69,6 +82,9 @@ func (m Material) Seal(s seal.Seal) (Material, error) {
 	m.IntermediateKeyPEM = nil
 	return m, nil
 }
+
+// HeldInHardware reports whether the intermediate signs inside a device.
+func (m Material) HeldInHardware() bool { return m.IntermediateRef != nil }
 
 // intermediateKey recovers the private half, which requires the seal.
 func (m Material) intermediateKey(s seal.Seal) ([]byte, error) {
@@ -167,26 +183,7 @@ func Genesis(commonName string, permittedDNS []string, permittedIPs []*net.IPNet
 		IsCA:                  true,
 		MaxPathLenZero:        true,
 	}
-	if len(permittedDNS) > 0 {
-		interTmpl.PermittedDNSDomainsCritical = true
-		interTmpl.PermittedDNSDomains = permittedDNS
-		// Close the cross-type gap: a DNS-only constraint leaves IP and email
-		// name forms unconstrained in a conforming verifier (E-02 F3).
-		//
-		// A constraint has to permit what the authority is actually expected to
-		// issue. Excluding every IP range is the right default for a CA that
-		// only names hosts by DNS, but it makes IP SANs impossible — so an
-		// authority that must issue them says which ranges instead.
-		if len(permittedIPs) > 0 {
-			interTmpl.PermittedIPRanges = permittedIPs
-		} else {
-			interTmpl.ExcludedIPRanges = []*net.IPNet{
-				{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
-				{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
-			}
-		}
-		interTmpl.ExcludedEmailAddresses = []string{""}
-	}
+	applyNameConstraints(interTmpl, permittedDNS, permittedIPs)
 	interDER, err := x509.CreateCertificate(rand.Reader, interTmpl, root, interKey.Public(), rootKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: create intermediate: %w", err)
@@ -210,6 +207,32 @@ func Genesis(commonName string, permittedDNS []string, permittedIPs []*net.IPNet
 	}, nil
 }
 
+// applyNameConstraints puts the delegated namespace on the intermediate.
+//
+// Constraints are defense in depth here, not the primary control: E-02 measured
+// that DNS constraints are honored widely while URI constraints break
+// verification outright in the rustls/webpki family, so DNS, IP, and email
+// subtrees are emitted and URI constraints are not. A DNS-only constraint would
+// leave IP and email forms unconstrained in a conforming verifier, so those are
+// closed too — by permitting specific ranges when the authority must issue
+// them, and excluding everything otherwise.
+func applyNameConstraints(tmpl *x509.Certificate, permittedDNS []string, permittedIPs []*net.IPNet) {
+	if len(permittedDNS) == 0 {
+		return
+	}
+	tmpl.PermittedDNSDomainsCritical = true
+	tmpl.PermittedDNSDomains = permittedDNS
+	if len(permittedIPs) > 0 {
+		tmpl.PermittedIPRanges = permittedIPs
+	} else {
+		tmpl.ExcludedIPRanges = []*net.IPNet{
+			{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+			{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		}
+	}
+	tmpl.ExcludedEmailAddresses = []string{""}
+}
+
 // Load parses stored material into a usable authority. The seal is needed to
 // open the intermediate key; pass nil to load only the public half, which is
 // enough to validate material without being able to sign with it.
@@ -223,6 +246,27 @@ func Load(m Material, s seal.Seal) (*CA, error) {
 		return nil, fmt.Errorf("ca: intermediate: %w", err)
 	}
 	loaded := &CA{root: root, intermediate: inter, material: m}
+
+	// A key held inside a token: ask the device for a signer rather than
+	// recovering material, because there is no material to recover.
+	if m.IntermediateRef != nil {
+		if s == nil {
+			return loaded, nil // public-only load
+		}
+		ss, err := seal.AsSigningSeal(s)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"this authority's intermediate key is held in hardware (%s) but %w",
+				m.IntermediateRef, err)
+		}
+		signer, err := ss.Signer(m.IntermediateRef)
+		if err != nil {
+			return nil, fmt.Errorf("cannot use the intermediate key %s: %w", m.IntermediateRef, err)
+		}
+		loaded.key = signer
+		return loaded, nil
+	}
+
 	if s == nil && m.SealedKey != nil {
 		// Public-only load: the authority can be inspected and its chain
 		// published, but nothing can be signed with it.
@@ -552,6 +596,9 @@ func dedupe(in []string) []string {
 // SealedBy reports which seal wrapping key holds the intermediate's private
 // material, or an empty string if it is not sealed.
 func (m Material) SealedBy() string {
+	if m.IntermediateRef != nil {
+		return "held in " + m.IntermediateRef.String()
+	}
 	if m.SealedKey == nil || m.SealedKey.DEK == nil {
 		return ""
 	}
@@ -561,6 +608,11 @@ func (m Material) SealedBy() string {
 // Rewrap moves the intermediate's private key from one seal to another. The
 // certificates are untouched — they are public and unaffected by custody.
 func (m Material) Rewrap(from, to seal.Seal) (Material, error) {
+	// Nothing to rewrap: the key lives in a device and was never wrapped.
+	// Moving it between devices is a re-key, not a rewrap.
+	if m.IntermediateRef != nil {
+		return m, nil
+	}
 	material, err := m.intermediateKey(from)
 	if err != nil {
 		return m, err
@@ -572,4 +624,95 @@ func (m Material) Rewrap(from, to seal.Seal) (Material, error) {
 	m.SealedKey = env
 	m.IntermediateKeyPEM = nil
 	return m, nil
+}
+
+// HardwareGenesis creates a root and intermediate whose private keys are
+// generated *inside* a token and never leave it.
+//
+// This is what a real certificate authority does, and it changes the operational
+// story in two ways worth understanding before choosing it:
+//
+//   - There is no root key file to protect, lose, or copy. The offline root is
+//     offline because the token is in a safe, not because a file is on a USB
+//     stick. Re-issuing an intermediate becomes a ceremony with the device
+//     rather than a hunt for a key file.
+//   - There is also no way to recover the root if the token dies. A file can be
+//     backed up; a non-extractable key cannot, by definition. Operators who
+//     need survivability run two tokens and generate a root in each, or accept
+//     that losing the device means re-establishing trust from scratch.
+func HardwareGenesis(ss seal.SigningSeal, commonName string, permittedDNS []string, permittedIPs []*net.IPNet,
+	rootLabel, intermediateLabel string, rootTTL, intermediateTTL time.Duration, now time.Time) (*GenesisResult, error) {
+
+	rootRef, err := ss.GenerateSigner(rootLabel, seal.AlgECDSAP256)
+	if err != nil {
+		return nil, fmt.Errorf("generating the root key inside the token: %w", err)
+	}
+	rootSigner, err := ss.Signer(rootRef)
+	if err != nil {
+		return nil, fmt.Errorf("using the root key just generated: %w", err)
+	}
+
+	rootSerial, err := newSerial()
+	if err != nil {
+		return nil, err
+	}
+	rootTmpl := &x509.Certificate{
+		SerialNumber:          rootSerial,
+		Subject:               pkix.Name{CommonName: commonName + " Root CA"},
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(rootTTL),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            1,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, rootSigner.Public(), rootSigner)
+	if err != nil {
+		return nil, fmt.Errorf("self-signing the root certificate with the token-held key: %w", err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		return nil, err
+	}
+
+	interRef, err := ss.GenerateSigner(intermediateLabel, seal.AlgECDSAP256)
+	if err != nil {
+		return nil, fmt.Errorf("generating the intermediate key inside the token: %w", err)
+	}
+	interSigner, err := ss.Signer(interRef)
+	if err != nil {
+		return nil, fmt.Errorf("using the intermediate key just generated: %w", err)
+	}
+	interSerial, err := newSerial()
+	if err != nil {
+		return nil, err
+	}
+	interTmpl := &x509.Certificate{
+		SerialNumber:          interSerial,
+		Subject:               pkix.Name{CommonName: commonName + " Issuing CA"},
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.Add(intermediateTTL),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+	}
+	applyNameConstraints(interTmpl, permittedDNS, permittedIPs)
+
+	interDER, err := x509.CreateCertificate(rand.Reader, interTmpl, root, interSigner.Public(), rootSigner)
+	if err != nil {
+		return nil, fmt.Errorf("signing the intermediate with the token-held root key: %w", err)
+	}
+
+	return &GenesisResult{
+		Material: Material{
+			RootCertPEM:         pemEncode("CERTIFICATE", rootDER),
+			IntermediateCertPEM: pemEncode("CERTIFICATE", interDER),
+			IntermediateRef:     interRef,
+			RootRef:             rootRef,
+		},
+		// Deliberately empty: there is no root key to hand over, which is the
+		// entire point of this path.
+		RootKeyPEM: nil,
+	}, nil
 }

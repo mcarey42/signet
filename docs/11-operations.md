@@ -1,6 +1,7 @@
 # 11 — Operations
 
-**Status: Open**
+**Status: Draft** (seal, key custody, and rotation implemented; backups and
+anchored audit still design-only)
 
 ## Key custody & seal (Open — highest-stakes operational design)
 
@@ -150,6 +151,42 @@ key-encryption key: an attacker inside the running process must ask the device
 to open each key and loses that ability when the process dies, whereas a KEK
 would make rotation a single blob rewrite and hand that same attacker everything
 at once.
+
+### Keys held in hardware, not merely wrapped by it (implemented)
+
+There are two different things a device can do for a key, and the difference
+matters:
+
+| | Where the private key exists | What an attacker inside the process gets |
+|---|---|---|
+| **Wrapped** (envelope) | Encrypted at rest; **plaintext in Signet's memory when used** | The key, by reading memory |
+| **Held** (reference) | **Only inside the token, ever** | The ability to *ask* for signatures while the process lives |
+
+`signet genesis -ca-in-hardware` takes the second path for the CA. The root and
+intermediate keys are generated **inside the token** with `CKA_SENSITIVE` and
+`CKA_EXTRACTABLE=false`, and generation reads those attributes back — a token
+that quietly ignored them would be lying, so the ceremony refuses the key rather
+than trusting it. What Signet stores is a `KeyRef`: a pointer, not a secret.
+Every signature is computed in the device.
+
+Verified against SoftHSM: certificates issued this way verify against the chain,
+no PEM key material exists in `state.db`, `raft.db`, or on disk anywhere, **no
+root key file exists**, and `pkcs11-tool --read-object --type privkey` is
+refused by the token.
+
+The operational trade is real and stated at genesis time:
+
+- There is no root key file to protect, lose, or copy. "Offline root" becomes
+  a token in a safe rather than a file on a USB stick, and re-issuing an
+  intermediate becomes a ceremony with the device.
+- There is also **no way to back the root up**. A non-extractable key cannot be
+  copied, by definition. Survivability means two tokens each holding their own
+  root, or accepting that losing the device means re-establishing trust from
+  scratch.
+
+Signing keys for the offline dialects (OIDC tokens, SSH certificates) are still
+*wrapped* rather than *held*; moving them to references is the same mechanism
+and is the natural next step.
 
 Still open: per-subtree DEKs for KV values (cryptographic erase of a subtree),
 and rotation of the signing keys themselves, which is the separate operation you

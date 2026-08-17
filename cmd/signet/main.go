@@ -151,7 +151,10 @@ func cmdGenesis(args []string) error {
 	caCN := fs.String("ca-common-name", "", "create a certificate authority with this name (skipped if empty)")
 	caDomains := fs.String("ca-domains", "", "comma-separated DNS domains the CA may issue for")
 	caIPRanges := fs.String("ca-ip-ranges", "", "comma-separated CIDRs the CA may issue IP SANs for (default: none, and IP SANs are excluded outright)")
-	rootKeyOut := fs.String("root-key-out", "", "where to write the root private key (default DATA-DIR/../root-ca.key)")
+	rootKeyOut := fs.String("root-key-out", "", "where to write the root private key (default DATA-DIR/../root-ca.key; unused with -ca-in-hardware)")
+	caInHardware := fs.Bool("ca-in-hardware", false, "generate the CA keys inside the seal's token so they never exist outside it (requires a pkcs11 seal)")
+	caRootLabel := fs.String("ca-root-label", "signet-root-ca", "label for the root key inside the token")
+	caInterLabel := fs.String("ca-intermediate-label", "signet-issuing-ca", "label for the intermediate key inside the token")
 	serveCertOut := fs.String("server-cert-out", "", "directory to write this server's own TLS material (tls.crt, tls.key, ca.crt)")
 	serverNames := fs.String("server-names", "", "comma-separated DNS names and IPs for that certificate")
 	if err := fs.Parse(args); err != nil {
@@ -211,7 +214,13 @@ func cmdGenesis(args []string) error {
 	}
 
 	if *caCN != "" {
-		if err := genesisCA(ctx, k, rootID, *caCN, *caDomains, *caIPRanges, caKeyPath(*dataDir, *rootKeyOut)); err != nil {
+		opts := caOptions{
+			commonName: *caCN, domains: *caDomains, ipRanges: *caIPRanges,
+			rootKeyPath: caKeyPath(*dataDir, *rootKeyOut),
+			inHardware:  *caInHardware, rootLabel: *caRootLabel, interLabel: *caInterLabel,
+			seal: node.Seal(),
+		}
+		if err := genesisCA(ctx, k, rootID, opts); err != nil {
 			return err
 		}
 	}
@@ -274,7 +283,16 @@ func cmdGenesis(args []string) error {
 // stored. Everything written to the FSM lands in the Raft log and in every
 // backup generation built from it, so a root key that touched state would make
 // "the root is offline" false forever after (docs/14, E-13 F6).
-func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, domains, ipRanges, rootKeyPath string) error {
+type caOptions struct {
+	commonName, domains, ipRanges string
+	rootKeyPath                   string
+	inHardware                    bool
+	rootLabel, interLabel         string
+	seal                          seal.Seal
+}
+
+func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, o caOptions) error {
+	commonName, domains, ipRanges, rootKeyPath := o.commonName, o.domains, o.ipRanges, o.rootKeyPath
 	// Idempotent like the rest of genesis: a domain that already has an
 	// authority keeps it. Minting a second root would orphan every certificate
 	// issued under the first.
@@ -299,6 +317,31 @@ func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, d
 		}
 		nets = append(nets, n)
 	}
+	if o.inHardware {
+		ss, err := seal.AsSigningSeal(o.seal)
+		if err != nil {
+			return fmt.Errorf(
+				"genesis: -ca-in-hardware was requested but %w.\n"+
+					"Either configure a hardware seal with -seal 'pkcs11:?module=...&token=...&pin=...&label=...',\n"+
+					"or drop -ca-in-hardware to generate the CA in software and take the root key file offline", err)
+		}
+		res, err := kernel.GenesisCAInHardware(ss, commonName, permitted, nets,
+			o.rootLabel, o.interLabel, 10*365*24*time.Hour, 365*24*time.Hour)
+		if err != nil {
+			return fmt.Errorf("genesis: hardware CA ceremony: %w", err)
+		}
+		if err := k.InstallCA(ctx, actor, "default", res.Material); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "  CA %q created for %v, keys held inside the token\n", commonName, permitted)
+		fmt.Fprintf(os.Stderr, "    root:         %s\n", res.Material.RootRef)
+		fmt.Fprintf(os.Stderr, "    intermediate: %s\n", res.Material.IntermediateRef)
+		fmt.Fprintf(os.Stderr, "  There is NO root key file, and none can be made: the keys are marked\n")
+		fmt.Fprintf(os.Stderr, "  non-extractable and cannot leave the device. Protect the token accordingly —\n")
+		fmt.Fprintf(os.Stderr, "  losing it means re-establishing this trust chain from scratch.\n")
+		return nil
+	}
+
 	res, err := kernel.GenesisCA(commonName, permitted, nets, 10*365*24*time.Hour, 365*24*time.Hour)
 	if err != nil {
 		return err
@@ -306,7 +349,10 @@ func genesisCA(ctx context.Context, k *kernel.Kernel, actor op.ID, commonName, d
 	// Write the root key before installing the CA: if this fails, no authority
 	// exists whose root nobody holds.
 	if err := os.WriteFile(rootKeyPath, res.RootKeyPEM, 0o400); err != nil {
-		return fmt.Errorf("genesis: write root key: %w", err)
+		return fmt.Errorf(
+			"genesis: could not write the root key to %s: %w.\n"+
+				"The CA was not installed. Check the directory exists and is writable, then re-run",
+			rootKeyPath, err)
 	}
 	if err := k.InstallCA(ctx, actor, "default", res.Material); err != nil {
 		return err

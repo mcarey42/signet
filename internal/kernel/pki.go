@@ -38,9 +38,13 @@ func applyPutCA(tx *store.Tx, o *op.PutCA) op.Result {
 	if _, err := ca.Load(m, nil); err != nil {
 		return op.Result{Err: err}
 	}
-	// The private half must already be sealed before it reaches the log.
+	// The private half must already be sealed — or held in a device, in which
+	// case there is no half to protect — before it reaches the log.
 	if len(m.IntermediateKeyPEM) != 0 {
-		return op.Result{Err: errors.New("ca: refusing plaintext intermediate key; material must be sealed before it is proposed")}
+		return op.Result{Err: errors.New(
+			"ca: refusing to store a plaintext intermediate key. Key material must be sealed " +
+				"before it is proposed, or held inside a token, so that the replicated log never " +
+				"contains a key the barrier alone can open")}
 	}
 	if err := tx.Put(store.BucketCA, o.Name, o.Material); err != nil {
 		return op.Result{Err: err}
@@ -243,10 +247,18 @@ func (k *Kernel) IssuanceLog(ctx context.Context, s Session) ([]IssuanceRecord, 
 	return out, err
 }
 
-// GenesisCA runs a root ceremony. The root private key is returned to the
-// caller and never stored.
+// GenesisCA runs a root ceremony in software. The root private key is returned
+// to the caller and never stored.
 func GenesisCA(commonName string, permittedDNS []string, permittedIPs []*net.IPNet, rootTTL, interTTL time.Duration) (*ca.GenesisResult, error) {
 	return ca.Genesis(commonName, permittedDNS, permittedIPs, rootTTL, interTTL, time.Now())
+}
+
+// GenesisCAInHardware runs a root ceremony inside a token. Neither key ever
+// exists outside the device, so there is no root key file — and no way to make
+// one.
+func GenesisCAInHardware(ss seal.SigningSeal, commonName string, permittedDNS []string, permittedIPs []*net.IPNet,
+	rootLabel, interLabel string, rootTTL, interTTL time.Duration) (*ca.GenesisResult, error) {
+	return ca.HardwareGenesis(ss, commonName, permittedDNS, permittedIPs, rootLabel, interLabel, rootTTL, interTTL, time.Now())
 }
 
 // --- SSH roles ------------------------------------------------------------

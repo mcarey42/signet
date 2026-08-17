@@ -38,23 +38,43 @@ the same object: a signed claim of *who, what scope, until when*.
 
 ## Status
 
-**MVP complete.** Unmodified [External Secrets Operator](https://external-secrets.io)
-reads secrets from Signet in a live Kubernetes cluster, authenticating as its
-own workload identity — no shared secret, no agent, no client changes. Run it
-yourself with `./test/kind/run.sh`.
+**Working, single-node.** Real clients use it unmodified today:
 
-A single-node domain: genesis initializes it, Kubernetes ServiceAccount tokens
-attest workloads, scoped RBAC bounds what each may read, the Vault-compatible
-dialect serves them, and state survives restart. See
-[docs/15-mvp-plan.md](docs/15-mvp-plan.md) for what is deliberately deferred
-(OIDC, SSH, agents, federation, internal CA) and [docs/](docs/README.md) for the
-design record behind every decision.
+- **[External Secrets Operator](https://external-secrets.io)** reads secrets,
+  authenticating as its own Kubernetes workload — no shared secret, no agent.
+- **[cert-manager](https://cert-manager.io)** obtains certificates from its CA.
+- **`kubectl`** authenticates to a real Kubernetes API server via OIDC, with
+  RBAC driven by Signet roles.
+- **`ssh`** logs into a real `sshd` with a Signet certificate and no
+  `authorized_keys` file.
+- **`bao`** (the OpenBao CLI) drives the KV surface.
+
+Keys can be *held inside a PKCS#11 HSM* — generated there, non-extractable,
+never present in Signet's memory — with a rotation ceremony to move custody
+between seals. See **[docs/16](docs/16-implementation-status.md)** for exactly
+what works versus what is still design.
+
+Run it yourself with `./test/kind/run.sh`.
+
+Still absent by design, each scheduled with the milestone that needs it:
+multi-node domains, federation and sovereign mode, the workstation agent,
+JIT/PAM activation, the GitOps reconciler, and backups. See
+[docs/](docs/README.md) for the design record behind every decision.
 
 ```bash
-make test && make build
+make test && make build      # static, pure-Go
+make test-hsm                # seal tests against a SoftHSM token
 
 # initialize a domain — prints a root token, writes a seal key
 signet genesis -data-dir ./data -config genesis.json
+
+# or put the CA keys inside an HSM, where they are generated and never leave
+signet genesis -data-dir ./data -ca-in-hardware \
+  -seal 'pkcs11:?module=/usr/lib/softhsm/libsofthsm2.so&token=signet&pin=…&label=signet-seal'
+
+# move key custody between seals; credentials issued before stay valid
+signet seal status -data-dir ./data
+signet seal rotate -data-dir ./data -to 'pkcs11:?module=…&token=…&pin=…&label=…'
 
 # serve the Vault-compatible API
 signet serve -data-dir ./data -listen 127.0.0.1:8200 -mount secrets

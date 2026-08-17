@@ -28,10 +28,15 @@ exploration is the raw material.
 | [08-agents-platforms](08-agents-platforms.md) | Workstation/host agents, native shims, k8s story | Draft (E-01) |
 | [09-module-layout](09-module-layout.md) | Go layout, dependency budget, footprint targets | Open |
 | [10-testing-strategy](10-testing-strategy.md) | Unit, property, fuzz, partition, interop matrix | Draft (E-01) |
-| [11-operations](11-operations.md) | Seal/unseal, backups, packaging, observability | Open |
+| [11-operations](11-operations.md) | Seal/unseal, key custody, rotation, backups | Draft |
 | [12-governance](12-governance.md) | License, disclosure, decision process | Open |
 | [13-kernel-data-model](13-kernel-data-model.md) | Principals, groups, roles, bindings, JIT/PAM, scope semantics | Draft |
 | [14-control-plane-lifecycle](14-control-plane-lifecycle.md) | Declarative config, genesis, node growth, JIT activation | Draft |
+| [15-mvp-plan](15-mvp-plan.md) | The vertical slice, layout, and build sequence | Draft |
+| **[16-implementation-status](16-implementation-status.md)** | **What actually works today vs. what is designed** | **Current** |
+
+**Start with [16](16-implementation-status.md)** if you want to know what runs
+today — the other documents describe the destination, not the current position.
 
 ## Conventions
 
