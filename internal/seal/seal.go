@@ -298,3 +298,64 @@ func (e *Envelope) Open(s Seal, aad []byte) ([]byte, error) {
 	}
 	return pt, nil
 }
+
+// RewrapRootKey moves the barrier root key from one seal to another.
+//
+// The root key itself does not change, so the barrier and every byte it
+// protects are untouched — this is a custody change, not a re-encryption of the
+// store. The previous wrapped form is kept beside it as root.seal.prev so an
+// interrupted ceremony can be reversed by hand.
+func RewrapRootKey(from, to Seal, dir string) error {
+	path := filepath.Join(dir, "root.seal")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("seal: %s: %w", path, err)
+	}
+	var b Blob
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return fmt.Errorf("seal: %s: %w", path, err)
+	}
+	// Already moved: a resumed ceremony must not fail on its own progress.
+	if b.Seal == to.Name() && b.KeyID == to.KeyID() {
+		if _, err := to.Unwrap(&b, []byte(rootKeyAAD)); err != nil {
+			return fmt.Errorf("seal: root key claims the new seal but does not open under it: %w", err)
+		}
+		return nil
+	}
+
+	key, err := from.Unwrap(&b, []byte(rootKeyAAD))
+	if err != nil {
+		return fmt.Errorf("seal: cannot unseal the root key with the current seal: %w", err)
+	}
+	next, err := to.Wrap(key, []byte(rootKeyAAD))
+	if err != nil {
+		return err
+	}
+	blob, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	// Keep the old form until the new one is durably in place.
+	if err := os.WriteFile(path+".prev", raw, 0o600); err != nil {
+		return err
+	}
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, blob, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// RootKeyWrappedBy reports which seal and wrapping key currently hold the root
+// key, without needing either seal to be available.
+func RootKeyWrappedBy(dir string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "root.seal"))
+	if err != nil {
+		return "", err
+	}
+	var b Blob
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return "", err
+	}
+	return b.Seal + "/" + b.KeyID, nil
+}

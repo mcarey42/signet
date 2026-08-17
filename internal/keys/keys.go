@@ -247,3 +247,34 @@ func thumbprint(pub crypto.PublicKey) (string, error) {
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+// SealedBy reports which seal wrapping key holds this key's material, or an
+// empty string if it is not sealed. Rotation uses it to tell what still needs
+// moving, and `seal status` uses it to surface a half-finished ceremony.
+func (k *Key) SealedBy() string {
+	if k.Sealed == nil || k.Sealed.DEK == nil {
+		return ""
+	}
+	return k.Sealed.DEK.Seal + "/" + k.Sealed.DEK.KeyID
+}
+
+// Rewrap moves the private material from one seal to another.
+//
+// The material itself is unchanged — this re-encloses it under a new data key
+// that the new seal holds. The key keeps its identity, so every credential
+// already issued under it stays valid: rotating the seal is not rotating the
+// key, and conflating the two would turn a custody change into an outage.
+func (k *Key) Rewrap(from, to seal.Seal) (*Key, error) {
+	material, err := k.private(from)
+	if err != nil {
+		return nil, err
+	}
+	env, err := seal.NewEnvelope(to, material, keyAAD(k.Purpose, k.ID))
+	if err != nil {
+		return nil, err
+	}
+	out := *k
+	out.Sealed = env
+	out.PrivatePEM = nil
+	return &out, nil
+}

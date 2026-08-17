@@ -37,38 +37,90 @@ type PKCS11Config struct {
 type PKCS11Seal struct {
 	mu      sync.Mutex
 	ctx     *pkcs11.Ctx
+	module  string
 	session pkcs11.SessionHandle
 	key     pkcs11.ObjectHandle
 	label   string
 	token   string
 }
 
+// PKCS#11 permits exactly one C_Initialize per *process*, not per handle, so
+// modules are shared and reference-counted. Without this, opening a second seal
+// on the same module fails with CKR_CRYPTOKI_ALREADY_INITIALIZED — which is
+// exactly what a seal-rotation ceremony does when it holds the old and new
+// seals at once.
+var (
+	modulesMu sync.Mutex
+	modules   = map[string]*moduleRef{}
+)
+
+type moduleRef struct {
+	ctx  *pkcs11.Ctx
+	refs int
+}
+
+func acquireModule(path string) (*pkcs11.Ctx, error) {
+	modulesMu.Lock()
+	defer modulesMu.Unlock()
+	if m, ok := modules[path]; ok {
+		m.refs++
+		return m.ctx, nil
+	}
+	ctx := pkcs11.New(path)
+	if ctx == nil {
+		return nil, fmt.Errorf("seal: cannot load PKCS#11 module %s", path)
+	}
+	if err := ctx.Initialize(); err != nil {
+		ctx.Destroy()
+		return nil, fmt.Errorf("seal: pkcs11 initialize: %w", err)
+	}
+	modules[path] = &moduleRef{ctx: ctx, refs: 1}
+	return ctx, nil
+}
+
+func releaseModule(path string) {
+	modulesMu.Lock()
+	defer modulesMu.Unlock()
+	m, ok := modules[path]
+	if !ok {
+		return
+	}
+	m.refs--
+	if m.refs > 0 {
+		return
+	}
+	// Finalize only when the last user is done: another seal on the same module
+	// would be left with a dead context otherwise.
+	m.ctx.Finalize()
+	m.ctx.Destroy()
+	delete(modules, path)
+}
+
 func openPKCS11(cfg PKCS11Config) (Seal, error) {
 	if cfg.Module == "" || cfg.Label == "" {
 		return nil, errors.New("seal: pkcs11 needs at least module= and label=")
 	}
-	ctx := pkcs11.New(cfg.Module)
-	if ctx == nil {
-		return nil, fmt.Errorf("seal: cannot load PKCS#11 module %s", cfg.Module)
-	}
-	if err := ctx.Initialize(); err != nil {
-		return nil, fmt.Errorf("seal: pkcs11 initialize: %w", err)
+	ctx, err := acquireModule(cfg.Module)
+	if err != nil {
+		return nil, err
 	}
 
 	slot, err := findSlot(ctx, cfg)
 	if err != nil {
-		ctx.Destroy()
+		releaseModule(cfg.Module)
 		return nil, err
 	}
 	session, err := ctx.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
 	if err != nil {
-		ctx.Destroy()
+		releaseModule(cfg.Module)
 		return nil, fmt.Errorf("seal: pkcs11 open session: %w", err)
 	}
 	if cfg.Pin != "" {
-		if err := ctx.Login(session, pkcs11.CKU_USER, cfg.Pin); err != nil {
+		// A token may already be logged in from another seal on the same
+		// module; that is success, not an error.
+		if err := ctx.Login(session, pkcs11.CKU_USER, cfg.Pin); err != nil && !isAlreadyLoggedIn(err) {
 			ctx.CloseSession(session)
-			ctx.Destroy()
+			releaseModule(cfg.Module)
 			return nil, fmt.Errorf("seal: pkcs11 login: %w", err)
 		}
 	}
@@ -76,10 +128,10 @@ func openPKCS11(cfg PKCS11Config) (Seal, error) {
 	key, err := findKey(ctx, session, cfg.Label)
 	if err != nil {
 		ctx.CloseSession(session)
-		ctx.Destroy()
+		releaseModule(cfg.Module)
 		return nil, err
 	}
-	return &PKCS11Seal{ctx: ctx, session: session, key: key, label: cfg.Label, token: cfg.Token}, nil
+	return &PKCS11Seal{ctx: ctx, module: cfg.Module, session: session, key: key, label: cfg.Label, token: cfg.Token}, nil
 }
 
 func findSlot(ctx *pkcs11.Ctx, cfg PKCS11Config) (uint, error) {
@@ -139,11 +191,15 @@ func (p *PKCS11Seal) Close() error {
 	if p.ctx == nil {
 		return nil
 	}
-	_ = p.ctx.Logout(p.session)
 	_ = p.ctx.CloseSession(p.session)
-	p.ctx.Destroy()
 	p.ctx = nil
+	releaseModule(p.module)
 	return nil
+}
+
+func isAlreadyLoggedIn(err error) bool {
+	var e pkcs11.Error
+	return errors.As(err, &e) && e == pkcs11.CKR_USER_ALREADY_LOGGED_IN
 }
 
 // Wrap encrypts inside the token. The plaintext crosses into the device and the

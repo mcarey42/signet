@@ -548,3 +548,28 @@ func dedupe(in []string) []string {
 	}
 	return out
 }
+
+// SealedBy reports which seal wrapping key holds the intermediate's private
+// material, or an empty string if it is not sealed.
+func (m Material) SealedBy() string {
+	if m.SealedKey == nil || m.SealedKey.DEK == nil {
+		return ""
+	}
+	return m.SealedKey.DEK.Seal + "/" + m.SealedKey.DEK.KeyID
+}
+
+// Rewrap moves the intermediate's private key from one seal to another. The
+// certificates are untouched — they are public and unaffected by custody.
+func (m Material) Rewrap(from, to seal.Seal) (Material, error) {
+	material, err := m.intermediateKey(from)
+	if err != nil {
+		return m, err
+	}
+	env, err := seal.NewEnvelope(to, material, []byte(caKeyAAD))
+	if err != nil {
+		return m, err
+	}
+	m.SealedKey = env
+	m.IntermediateKeyPEM = nil
+	return m, nil
+}

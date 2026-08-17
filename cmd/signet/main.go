@@ -45,6 +45,8 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet token    -data-dir DIR -principal PATH  mint a token (server must be stopped)
   signet kv get   -addr URL -token T PATH        read a secret over the API
   signet kv put   -addr URL -token T PATH k=v    write a secret over the API
+  signet seal status -data-dir DIR               show which seal holds the keys
+  signet seal rotate -data-dir DIR -to URI       move key custody to another seal
 `
 
 func main() {
@@ -62,6 +64,8 @@ func main() {
 		err = cmdToken(os.Args[2:])
 	case "kv":
 		err = cmdKV(os.Args[2:])
+	case "seal":
+		err = cmdSeal(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -584,6 +588,160 @@ func cmdToken(args []string) error {
 		return err
 	}
 	fmt.Println(token)
+	return nil
+}
+
+// --- seal ceremonies ------------------------------------------------------
+
+func cmdSeal(args []string) error {
+	if len(args) < 1 {
+		return errors.New("seal: expected status or rotate")
+	}
+	fs := flag.NewFlagSet("seal", flag.ExitOnError)
+	dataDir := fs.String("data-dir", "", "data directory")
+	sealKey := fs.String("seal", "", "current seal (default DATA-DIR/seal.key)")
+	to := fs.String("to", "", "destination seal for rotate")
+	actorPath := fs.String("actor", "/people/root", "principal performing the ceremony")
+	yes := fs.Bool("yes", false, "proceed without the confirmation prompt")
+	sub := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *dataDir == "" {
+		return errors.New("seal: -data-dir is required")
+	}
+
+	switch sub {
+	case "status":
+		return sealStatus(*dataDir, sealURI(*dataDir, *sealKey))
+	case "rotate":
+		if *to == "" {
+			return errors.New("seal rotate: -to is required")
+		}
+		return sealRotate(*dataDir, sealURI(*dataDir, *sealKey), sealURI(*dataDir, *to), *actorPath, *yes)
+	}
+	return fmt.Errorf("seal: unknown subcommand %q", sub)
+}
+
+func sealStatus(dataDir, sealCfg string) error {
+	wrappedBy, err := seal.RootKeyWrappedBy(dataDir)
+	if err != nil {
+		return fmt.Errorf("seal status: %w", err)
+	}
+	fmt.Printf("root key wrapped by: %s\n", wrappedBy)
+
+	node, k, err := openNode(dataDir, sealCfg)
+	if err != nil {
+		// Being unable to open is itself the answer: this is not the seal.
+		fmt.Printf("current seal:        cannot open the domain (%v)\n", err)
+		return nil
+	}
+	defer node.Close()
+	st := node.Status()
+	fmt.Printf("current seal:        %s/%s\n", st.SealName, st.SealKeyID)
+
+	items, err := k.SealInventory(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("sealed material:     %d items\n", len(items))
+	mixed := map[string]int{}
+	for _, it := range items {
+		by := it.SealedBy
+		if by == "" {
+			by = "(unsealed)"
+		}
+		mixed[by]++
+		fmt.Printf("  %-4s %-40s %s\n", it.Kind, it.Name, by)
+	}
+	if len(mixed) > 1 {
+		fmt.Println("\nWARNING: material is split across seals — a rotation did not finish.")
+		fmt.Println("Re-run `signet seal rotate` with the same destination; it resumes.")
+	}
+	return nil
+}
+
+// sealRotate moves custody of every sealed item, then the root key, then proves
+// the result by opening everything with the destination seal alone.
+//
+// Order matters. Material is rewrapped first and the root key last, because a
+// crash between them leaves a domain that still opens with the *old* seal —
+// recoverable by re-running. Doing it the other way would leave the store
+// unreadable until the ceremony was finished by hand.
+func sealRotate(dataDir, fromCfg, toCfg, actorPath string, yes bool) error {
+	if fromCfg == toCfg {
+		return errors.New("seal rotate: source and destination are the same seal")
+	}
+	from, err := seal.Open(fromCfg)
+	if err != nil {
+		return fmt.Errorf("seal rotate: current seal: %w", err)
+	}
+	defer from.Close()
+	to, err := seal.Open(toCfg)
+	if err != nil {
+		return fmt.Errorf("seal rotate: destination seal: %w", err)
+	}
+	defer to.Close()
+
+	fmt.Fprintf(os.Stderr, "rotating key custody\n  from: %s/%s\n  to:   %s/%s\n",
+		from.Name(), from.KeyID(), to.Name(), to.KeyID())
+	if !yes {
+		fmt.Fprint(os.Stderr, "\nKeep the current seal until this reports success — an interrupted\n"+
+			"ceremony needs both. Proceed? [y/N] ")
+		var answer string
+		fmt.Scanln(&answer)
+		if answer != "y" && answer != "Y" {
+			return errors.New("seal rotate: cancelled")
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	node, k, err := openNode(dataDir, fromCfg)
+	if err != nil {
+		return fmt.Errorf("seal rotate: open with the current seal: %w", err)
+	}
+	actor, err := k.PrincipalByPath(ctx, actorPath)
+	if err != nil {
+		node.Close()
+		return fmt.Errorf("seal rotate: actor %s: %w", actorPath, err)
+	}
+	moved, err := k.RotateSeal(ctx, actor.ID, from, to)
+	if err != nil {
+		node.Close()
+		return fmt.Errorf("seal rotate: %w", err)
+	}
+	for _, m := range moved {
+		fmt.Fprintf(os.Stderr, "  rewrapped %s %s\n", m.Kind, m.Name)
+	}
+	if len(moved) == 0 {
+		fmt.Fprintln(os.Stderr, "  (all material was already under the destination seal)")
+	}
+	node.Close()
+
+	// The root key moves last: until it does, the domain still opens with the
+	// old seal, so an interruption here is recoverable by re-running.
+	if err := seal.RewrapRootKey(from, to, dataDir); err != nil {
+		return fmt.Errorf("seal rotate: root key: %w", err)
+	}
+	fmt.Fprintln(os.Stderr, "  rewrapped the barrier root key")
+
+	// Prove it. Opening under the destination seal alone is the only honest
+	// check; a record that merely claims the new seal proves nothing.
+	verifyNode, vk, err := openNode(dataDir, toCfg)
+	if err != nil {
+		return fmt.Errorf("seal rotate: the domain does not open under the destination seal: %w", err)
+	}
+	defer verifyNode.Close()
+	if err := vk.VerifySealedMaterial(ctx, to); err != nil {
+		return fmt.Errorf("seal rotate: verification failed, keep the old seal: %w", err)
+	}
+
+	fmt.Printf("\nrotation complete and verified under %s/%s\n", to.Name(), to.KeyID())
+	fmt.Println("The old seal is no longer needed to run this domain.")
+	fmt.Println("Destroying it also shreds any backup taken before now: those hold")
+	fmt.Println("material wrapped by the old seal and nothing else can open them.")
 	return nil
 }
 

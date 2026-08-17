@@ -114,9 +114,46 @@ believes its keys are in an HSM and is wrong is worse off than one that will not
 start. `make test-hsm` provisions a SoftHSM token and runs the seal tests
 against it — the same code path a real HSM takes.
 
-Still open: rotating the seal itself (unwrap under the old, rewrap under the
-new) is a ceremony that has not been built yet, and the per-subtree DEKs for KV
-values remain future work.
+### Seal rotation (implemented)
+
+`signet seal rotate -to <uri>` moves custody from one seal to another — a file
+seal to an HSM, or one HSM key to its successor. `signet seal status` shows
+which wrapping key currently holds each item.
+
+It is a **rewrap, not a re-key**. Every signing key keeps its identity and the
+CA is untouched, so credentials already issued stay valid: changing who holds
+the wrapping key says nothing about the keys being wrapped, and conflating the
+two would turn a custody change into an outage. Verified end to end — after
+rotating a live domain from a file seal to SoftHSM, the JWKS `kid`, the CA
+fingerprint, and previously issued tokens are all unchanged.
+
+Order within the ceremony is deliberate: **material first, root key last**. A
+crash between them leaves a domain that still opens with the *old* seal, which
+is recoverable by re-running; the reverse order would leave the store unreadable
+until someone finished the job by hand. The ceremony is idempotent and resumable
+— items already under the destination are skipped — and it **proves the result
+by opening every item under the destination seal alone** before reporting
+success, because a record that merely claims the new seal proves nothing.
+
+Two operational consequences, both printed by the command:
+
+- Keep the old seal until the ceremony reports success. An interrupted run needs
+  both.
+- Destroying the old seal also shreds **any backup taken before the rotation**:
+  those hold material wrapped by the old seal and nothing else can open them.
+  That is the crypto-shredding property working as intended, but it is only
+  desirable if you meant it.
+
+Cost is O(number of signing keys), i.e. a handful. That is the deliberate price
+of wrapping envelopes with the seal *directly* rather than under an intermediate
+key-encryption key: an attacker inside the running process must ask the device
+to open each key and loses that ability when the process dies, whereas a KEK
+would make rotation a single blob rewrite and hand that same attacker everything
+at once.
+
+Still open: per-subtree DEKs for KV values (cryptographic erase of a subtree),
+and rotation of the signing keys themselves, which is the separate operation you
+perform when a *key* rather than a *seal* is suspect.
 
 ## Superseded: the original question (raised 2026-08-16)
 
