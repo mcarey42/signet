@@ -18,6 +18,7 @@
 package seal
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strconv"
@@ -197,6 +198,12 @@ func (p *PKCS11Seal) Close() error {
 	return nil
 }
 
+// GCM parameters, named rather than inlined so the two call sites cannot drift.
+const (
+	gcmNonceLen = 12  // 96 bits, the only length GCM is defined for without rehashing
+	gcmTagBits  = 128 // full-length tag; a shorter one weakens forgery resistance
+)
+
 func isAlreadyLoggedIn(err error) bool {
 	var e pkcs11.Error
 	return errors.As(err, &e) && e == pkcs11.CKR_USER_ALREADY_LOGGED_IN
@@ -208,9 +215,30 @@ func (p *PKCS11Seal) Wrap(plaintext, aad []byte) (*Blob, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// The token generates the IV for GCM, which is why it comes back in the
-	// mechanism parameters rather than being chosen here.
-	params := pkcs11.NewGCMParams(nil, aad, 128)
+	// WE generate the IV, rather than passing NULL and trusting the token to.
+	//
+	// This used to pass a NULL IV and read one back out of the mechanism
+	// parameters. CK_GCM_PARAMS is an INPUT structure in PKCS#11 v2.40 — who
+	// generates the IV is underspecified, implementations disagree, and v3.0
+	// added a separate message interface precisely because of that ambiguity.
+	//
+	// Measured against SoftHSM2: it wrote nothing back, so every Blob carried
+	// an EMPTY nonce and every wrap ran under the same IV. That is not a
+	// compatibility wart, it is keystream reuse — proven by the test in
+	// pkcs11_gcm_test.go, where C1 XOR C2 came out exactly equal to
+	// P1 XOR P2, meaning the XOR of any two wrapped secrets was recoverable by
+	// anyone holding the ciphertexts. Under this seal that is the root key and
+	// every DEK.
+	//
+	// Generating it here removes the question instead of answering it, and it
+	// is the portable choice: a token that would have generated its own IV
+	// accepts a supplied one, while one that expects a supplied IV cannot work
+	// any other way.
+	nonce := make([]byte, gcmNonceLen)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("seal: generating a GCM nonce: %w", err)
+	}
+	params := pkcs11.NewGCMParams(nonce, aad, gcmTagBits)
 	defer params.Free()
 	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
 	if err := p.ctx.EncryptInit(p.session, mech, p.key); err != nil {
@@ -220,7 +248,9 @@ func (p *PKCS11Seal) Wrap(plaintext, aad []byte) (*Blob, error) {
 	if err != nil {
 		return nil, fmt.Errorf("seal: pkcs11 encrypt: %w", err)
 	}
-	return &Blob{Seal: p.Name(), KeyID: p.KeyID(), Nonce: params.IV(), CT: ct}, nil
+	// Store the nonce we chose. Reading it back from the parameters would
+	// reintroduce the dependency on the token having written one.
+	return &Blob{Seal: p.Name(), KeyID: p.KeyID(), Nonce: nonce, CT: ct}, nil
 }
 
 func (p *PKCS11Seal) Unwrap(b *Blob, aad []byte) ([]byte, error) {
@@ -230,7 +260,14 @@ func (p *PKCS11Seal) Unwrap(b *Blob, aad []byte) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	params := pkcs11.NewGCMParams(b.Nonce, aad, 128)
+	if len(b.Nonce) != gcmNonceLen {
+		return nil, fmt.Errorf(
+			"seal: this blob carries a %d-byte GCM nonce, expected %d. Blobs written before the "+
+				"nonce fix carry an empty one and were all encrypted under a single IV; treat any "+
+				"material wrapped by them as compromised and re-wrap it",
+			len(b.Nonce), gcmNonceLen)
+	}
+	params := pkcs11.NewGCMParams(b.Nonce, aad, gcmTagBits)
 	defer params.Free()
 	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
 	if err := p.ctx.DecryptInit(p.session, mech, p.key); err != nil {
