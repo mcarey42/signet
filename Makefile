@@ -103,3 +103,11 @@ test-audit: build
 test-pam: build
 	@cp $(BIN) ./signet-testbin
 	@BIN=$(PWD)/signet-testbin ./test/pam/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s
+
+# The race detector over the whole suite. Note what this does and does not
+# prove: most tests are single-goroutine, so a clean run means the concurrent
+# paths that ARE exercised are clean, not that the system is race-free.
+.PHONY: test-race
+test-race: $(BUILD_DIR)
+	@$(SYNC)
+	@cd $(BUILD_DIR) && go test ./... -race -count=1

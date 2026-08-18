@@ -150,7 +150,7 @@ func Handler(r *Registry) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		r.WriteTo(w)
+		r.Render(w)
 	})
 }
 

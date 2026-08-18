@@ -54,8 +54,13 @@ func (r *Registry) register(m metric) {
 	r.metrics = append(r.metrics, m)
 }
 
-// WriteTo renders the registry in Prometheus text exposition format.
-func (r *Registry) WriteTo(w io.Writer) {
+// Render writes the registry in Prometheus text exposition format.
+//
+// Deliberately not named WriteTo: that name belongs to io.WriterTo, whose
+// contract returns (int64, error), and a method with the same name and a
+// different signature is the kind of thing that silently fails to satisfy an
+// interface somebody expected it to.
+func (r *Registry) Render(w io.Writer) {
 	r.mu.RLock()
 	ms := make([]metric, len(r.metrics))
 	copy(ms, r.metrics)
