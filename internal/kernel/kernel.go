@@ -15,6 +15,7 @@ import (
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/trace"
 )
 
 var (
@@ -81,6 +82,12 @@ type Evidence struct {
 // another key is rejected before any policy is consulted. Only then does a rule
 // decide which principal the proven identity becomes.
 func (k *Kernel) Login(ctx context.Context, ev Evidence) (string, Session, error) {
+	// The rule is policy and safe to name; the evidence is a bearer credential
+	// and is only ever recorded as a salted digest, so one token can be
+	// followed through a trace without ever appearing in it.
+	trace.Do(trace.AreaAttest, "login.begin", func(e *trace.Event) {
+		e.Str("rule", ev.Rule).Redact("evidence", ev.Material)
+	})
 	var (
 		mapping Mapping
 		issuer  Issuer

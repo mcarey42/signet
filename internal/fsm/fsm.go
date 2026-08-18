@@ -16,6 +16,7 @@ import (
 	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/trace"
 )
 
 // opAAD binds an encrypted log payload to its purpose.
@@ -143,6 +144,10 @@ func (f *FSM) Apply(l *raft.Log) any {
 		return op.Result{Err: halt}
 	}
 	f.applied.Store(l.Index)
+	trace.Do(trace.AreaApply, "entry.applied", func(e *trace.Event) {
+		e.Int("index", int64(l.Index)).Int("term", int64(l.Term)).
+			Str("kind", o.OpKind().String()).Err(res.Err)
+	})
 	return res
 }
 

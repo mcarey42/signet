@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"net/http"
+
+	"github.com/mcarey42/signet/internal/trace"
 	"sync"
 	"time"
 )
@@ -136,8 +138,15 @@ func Middleware(next http.Handler) http.Handler {
 		if pattern == "" {
 			pattern = "unmatched"
 		}
+		dur := time.Since(start)
+		trace.Do(trace.AreaHTTP, "request", func(e *trace.Event) {
+			// The route PATTERN, never the concrete path: a concrete path can
+			// carry a secret's name, and this file may be sent to someone.
+			e.Str("route", pattern).Str("method", r.Method).
+				Int("status", int64(rec.status)).Dur("took", dur)
+		})
 		m := forRoute(pattern)
-		m.dur.Observe(time.Since(start).Seconds())
+		m.dur.Observe(dur.Seconds())
 		m.total.Inc()
 		if rec.status >= 400 || rec.status == 0 {
 			m.errs.Inc()

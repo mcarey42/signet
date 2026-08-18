@@ -37,6 +37,7 @@ import (
 	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/seal"
+	"github.com/mcarey42/signet/internal/trace"
 )
 
 const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
@@ -52,6 +53,7 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet trust ...                               trust bundles (see: signet trust help)
   signet audit ...                               tamper-evident history (see: signet audit help)
   signet pam ...                                 privileged access (see: signet pam help)
+  signet trace help                              how to capture a diagnostic trace
 `
 
 func main() {
@@ -75,6 +77,8 @@ func main() {
 		err = cmdTrust(os.Args[2:])
 	case "audit":
 		err = cmdAudit(os.Args[2:])
+	case "trace":
+		err = cmdTrace(os.Args[2:])
 	case "pam":
 		err = cmdPAM(os.Args[2:])
 	case "ca":
@@ -608,6 +612,8 @@ func cmdServe(args []string) error {
 	domain := fs.String("domain", "", "this trust domain's name, e.g. home.example.net (named in audit checkpoints)")
 	metricsListen := fs.String("metrics-listen", "", "serve Prometheus metrics on this address, e.g. 127.0.0.1:9101 (off by default)")
 	maxBody := fs.Int64("max-body-bytes", 8<<20, "largest request body accepted on any route")
+	tracePath := fs.String("trace-file", "", "write a diagnostic trace here (off unless set; see `signet trace help`)")
+	traceAreas := fs.String("trace-areas", "all", "comma-separated areas to trace: "+traceAreaList())
 	oidcAudiences := fs.String("oidc-audiences", "", "comma-separated audiences the token-exchange endpoint may mint for (empty closes it)")
 	oidcMaxTTL := fs.Duration("oidc-max-ttl", 12*time.Hour, "ceiling on any offline credential this node issues")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
@@ -620,6 +626,21 @@ func cmdServe(args []string) error {
 	}
 	if *dataDir == "" {
 		return errors.New("serve: -data-dir is required")
+	}
+
+	if *tracePath != "" {
+		areas, err := trace.ParseAreas(*traceAreas)
+		if err != nil {
+			return err
+		}
+		if err := trace.StartFile(*tracePath, areas...); err != nil {
+			return err
+		}
+		defer trace.Stop()
+		fmt.Fprintf(os.Stderr,
+			"signet: tracing %s to %s — this file records paths and identifiers but no secret "+
+				"values, tokens, or key material; read `signet trace help` before sharing it\n",
+			*traceAreas, *tracePath)
 	}
 
 	node, k, err := openNode(*dataDir, sealURI(*dataDir, *sealKey))

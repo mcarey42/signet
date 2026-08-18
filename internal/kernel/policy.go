@@ -6,6 +6,7 @@ import (
 	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/store"
+	"github.com/mcarey42/signet/internal/trace"
 )
 
 // LoadBindings returns every binding held by a subject. Bindings are keyed
@@ -46,6 +47,14 @@ func HasAuthority(tx *store.Tx, subject op.ID, v Verb, path string, nowSec int64
 		} else {
 			metrics.AuthzDenied.Inc()
 		}
+		// "Why was this denied" is the most common question a trace is turned
+		// on to answer, so the decision records what it looked at, not just
+		// what it concluded.
+		trace.Do(trace.AreaAuthz, "decision", func(e *trace.Event) {
+			e.Str("subject", string(subject)).Str("verb", string(v)).Str("path", path).
+				Bool("allowed", allowed).Int("bindings_examined", int64(scanned)).
+				Int("at", nowSec)
+		})
 	}()
 
 	// Streamed rather than materialized. Every stored binding is individually
@@ -68,9 +77,18 @@ func HasAuthority(tx *store.Tx, subject op.ID, v Verb, path string, nowSec int64
 			return true
 		}
 		if b.NotAfter != 0 && nowSec >= b.NotAfter {
-			return true // expired JIT grant: simply stops being honored
+			trace.Do(trace.AreaAuthz, "binding.expired", func(e *trace.Event) {
+				e.Str("binding", string(b.ID)).Str("role", b.Role).
+					Str("scope", b.Scope).Int("not_after", b.NotAfter)
+			})
+			return true
 		}
 		if !ScopeCovers(b.Scope, path) || !roleGrants(b.Role, v) {
+			trace.Do(trace.AreaAuthz, "binding.skipped", func(e *trace.Event) {
+				e.Str("binding", string(b.ID)).Str("role", b.Role).Str("scope", b.Scope).
+					Bool("covers", ScopeCovers(b.Scope, path)).
+					Bool("grants_verb", roleGrants(b.Role, v))
+			})
 			return true
 		}
 		if !b.ActivationRequired {
