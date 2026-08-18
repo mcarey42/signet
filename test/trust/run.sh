@@ -42,8 +42,11 @@ for n in a b; do
   $BIN genesis -data-dir "node-$n" -config cfg.json > "node-$n/gen.txt" 2>&1
   grep -o 'signet\.[A-Za-z0-9._-]*' "node-$n/gen.txt" | head -1 > "node-$n/token"
   $BIN ca request -data-dir "node-$n" -out "issuer-$n.csr" -common-name "issuer $n" >/dev/null
+  # -trust-domain records which domain's bundle this issuer belongs in. Its DNS
+  # constraint ($n.example.net) and the trust domain (home.example.net) are
+  # different things, so the association is recorded rather than inferred.
   $BIN ca sign-issuer -root root -csr "issuer-$n.csr" -out "issuer-$n.crt" \
-      -domains "$n.example.net" -ttl 4380h >/dev/null
+      -domains "$n.example.net" -trust-domain home.example.net -ttl 4380h >/dev/null
   $BIN ca install -data-dir "node-$n" -cert "issuer-$n.crt" -root-cert root/root.crt \
       -node-id "node-$n" >/dev/null
 done
@@ -100,7 +103,10 @@ refutes "pinned consumer refuses the sibling issuer's leaf (subdivision is real)
 
 step "6. what the bundle refuses"
 $BIN ca init-root -out evil -common-name "Example" -ttl 8760h >/dev/null
-mkdir -p evil/issuers && cp root/issuers/*.crt evil/issuers/
+# The impostor copies the real root's issuer records wholesale — certificates
+# and their trust-domain sidecars — so its bundle is well formed in every
+# respect except the one that matters: who signed it.
+mkdir -p evil/issuers && cp root/issuers/* evil/issuers/
 $BIN ca bundle -root evil -domain home.example.net -out evil.json >/dev/null
 refutes "a bundle from an impostor root with the same name" \
   $BIN trust verify -bundle evil.json -pin "$PIN"

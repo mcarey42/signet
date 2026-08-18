@@ -68,6 +68,16 @@ for d in home gcp aws; do
 done
 ok "home and gcp subordinate to the org root; aws standing on its own"
 
+# Create the rogue sibling issuer BEFORE the bundles are published. The
+# original ordering created it afterwards, which is exactly why this test
+# missed that `ca bundle` was publishing every sibling's issuer into every
+# domain's bundle -- the defence it asserts was vacuous and the test could not
+# tell.
+openssl ecparam -name prime256v1 -genkey -noout -out rogue.key 2>/dev/null
+openssl req -new -key rogue.key -out rogue-ca.csr -subj "/CN=home rogue issuer" 2>/dev/null
+$BIN ca sign-issuer -root org-root -csr rogue-ca.csr -out rogue-ca.crt \
+   -domains home.example.net -ttl 4380h >/dev/null
+
 step "3. each domain publishes its own bundle"
 for d in home gcp; do
   $BIN ca bundle -root org-root -domain "$d.example.net" -out "$d-bundle.json" -max-age 720h >/dev/null
@@ -81,6 +91,24 @@ for d in home gcp aws; do
      -token "$(cat node-$d/token)" -bundle "$d-bundle.json" >/dev/null
 done
 ok "three bundles published, one per domain"
+
+# Assert on what the bundles actually CONTAIN, not just that publishing worked.
+# The property is no CROSS-DOMAIN leakage: a domain may publish several of its
+# own issuers (the rogue CA above is a legitimately-constrained second home
+# issuer, which is the point of the attack), but a sibling's issuer appearing
+# here is what makes the whole defence vacuous.
+check_no_leak() { # check_no_leak DOMAIN FOREIGN_SUBSTRING
+  names=$(python3 -c "
+import json,base64
+p=json.loads(base64.b64decode(json.load(open('$1-bundle.json'))['payload']))
+print(','.join(sorted(i['name'] for i in p['issuers'])))")
+  case "$names" in
+    *"$2"*) bad "$1.example.net publishes [$names] — a $2 issuer here makes the defence vacuous" ;;
+    *)      ok  "$1.example.net publishes no $2 issuer ($names)" ;;
+  esac
+}
+check_no_leak home gcp
+check_no_leak gcp home
 
 step "4. one consumer federates with all three"
 S=consumer/trust.json
@@ -134,10 +162,6 @@ fi
 # but naming a gcp identity. home's issuing key lives sealed inside its node, so
 # we mint the equivalent with a standalone CA that the org root also signed --
 # the same shape as a compromised sibling.
-openssl ecparam -name prime256v1 -genkey -noout -out rogue.key 2>/dev/null
-openssl req -new -key rogue.key -out rogue-ca.csr -subj "/CN=home rogue issuer" 2>/dev/null
-$BIN ca sign-issuer -root org-root -csr rogue-ca.csr -out rogue-ca.crt \
-   -domains home.example.net -ttl 4380h >/dev/null
 cat > forge.cnf <<'EOF'
 [v3]
 subjectAltName=URI:spiffe://gcp.example.net/workload/api

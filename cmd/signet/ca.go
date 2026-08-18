@@ -198,6 +198,7 @@ func caSignIssuer(args []string) error {
 	csrPath := fs.String("csr", "", "the signing request to certify")
 	out := fs.String("out", "", "file to write the issuer certificate to")
 	domains := fs.String("domains", "", "comma-separated DNS namespace this issuer may issue within")
+	trustDomain := fs.String("trust-domain", "", "the trust domain this issuer serves, if it differs from -domains (recorded so `ca bundle` knows whose bundle it belongs in)")
 	ipRanges := fs.String("ip-ranges", "", "comma-separated CIDRs it may issue IP SANs for (default: none, excluded outright)")
 	ttl := fs.Duration("ttl", 365*24*time.Hour, "issuer lifetime")
 	sealCfg := fs.String("seal", "", "seal holding the root key, for a hardware root")
@@ -271,7 +272,7 @@ func caSignIssuer(args []string) error {
 	// Keep a copy beside the root. The bundle ceremony runs here, offline, and
 	// needs every issuer it has ever certified; hunting them back down from the
 	// nodes afterwards would be the wrong direction of travel.
-	if err := recordIssuerCopy(*rootDir, issuerPEM); err != nil {
+	if err := recordIssuerCopy(*rootDir, issuerPEM, *trustDomain); err != nil {
 		return fmt.Errorf("ca sign-issuer: recording the issuer copy: %w", err)
 	}
 
@@ -391,7 +392,7 @@ func caIssuers(args []string) error {
 // recordIssuerCopy files a signed issuer under the root directory, named by its
 // public key so re-signing the same key replaces the entry instead of
 // accumulating stale duplicates in every future bundle.
-func recordIssuerCopy(rootDir string, issuerPEM []byte) error {
+func recordIssuerCopy(rootDir string, issuerPEM []byte, trustDomain string) error {
 	cert, err := parseCertPEM(issuerPEM)
 	if err != nil {
 		return err
@@ -401,5 +402,16 @@ func recordIssuerCopy(rootDir string, issuerPEM []byte) error {
 		return err
 	}
 	fp := strings.TrimPrefix(trust.Fingerprint(cert), "sha256:")
-	return os.WriteFile(filepath.Join(dir, fp+".crt"), issuerPEM, 0o644)
+	if err := os.WriteFile(filepath.Join(dir, fp+".crt"), issuerPEM, 0o644); err != nil {
+		return err
+	}
+	// Record which trust domain this issuer serves, when it is not simply the
+	// DNS namespace delegated to it. A trust domain is an identity namespace
+	// and a name constraint bounds certificate SANs; they often coincide but
+	// are not the same thing, and `ca bundle` must not have to guess which
+	// issuers belong in a given domain's bundle.
+	if trustDomain != "" {
+		return os.WriteFile(filepath.Join(dir, fp+".domain"), []byte(trustDomain+"\n"), 0o644)
+	}
+	return nil
 }

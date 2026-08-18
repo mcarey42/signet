@@ -86,6 +86,7 @@ func caBundle(args []string) error {
 	maxAge := fs.Duration("max-age", 30*24*time.Hour, "how long a consumer may believe this bundle")
 	epoch := fs.Uint64("epoch", 0, "publication number (default: one past the last published here)")
 	revoke := fs.String("revoke", "", "comma-separated issuer fingerprints to withdraw")
+	extraIssuers := fs.String("issuer", "", "comma-separated issuer common names to publish regardless of their name constraints")
 	sealCfg := fs.String("seal", "", "seal holding the root key, for a hardware root")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -104,15 +105,41 @@ func caBundle(args []string) error {
 		Role: trust.RoleRoot, Name: rootCert.Subject.CommonName,
 		CertPEM: pemEncodeCert(rootCert), SPKI: trust.Fingerprint(rootCert),
 	}}
-	issuers, err := readIssuerDir(filepath.Join(*rootDir, "issuers"))
+	all, err := readIssuerDir(filepath.Join(*rootDir, "issuers"))
 	if err != nil {
 		return fmt.Errorf("ca bundle: %w", err)
 	}
-	if len(issuers) == 0 {
+	if len(all) == 0 {
 		return fmt.Errorf(
 			"ca bundle: no issuer certificates in %s. `signet ca sign-issuer` records each issuer "+
 				"it signs there; a bundle with no issuers would name anchors but give a verifier "+
 				"nothing to build a path with", filepath.Join(*rootDir, "issuers"))
+	}
+
+	// Publish only the issuers that may actually issue for THIS domain.
+	//
+	// The root signs every domain's issuer, so its issuer directory holds all
+	// of them. Publishing that whole directory in every domain's bundle is what
+	// makes the sibling-impersonation defence vacuous: a verifier requires the
+	// chain to run through an issuer the domain published, and if a sibling's
+	// issuer is in that list, the requirement is satisfied by the very issuer
+	// it was meant to exclude. Found by the test-design pass; both existing
+	// tests missed it because both built the issuer set by hand instead of
+	// using this command.
+	//
+	// The filter is the delegation already recorded in the certificate: an
+	// issuer whose name constraints do not permit this domain has no business
+	// vouching for it. That needs no new bookkeeping from the operator, and it
+	// cannot drift from what the issuer is actually allowed to do.
+	issuers, excluded := filterIssuersForDomain(
+		all, *domain, splitList(*extraIssuers), recordedDomains(filepath.Join(*rootDir, "issuers")))
+	if len(issuers) == 0 {
+		return fmt.Errorf(
+			"ca bundle: none of the %d issuer(s) in %s are constrained to %q, so this bundle would "+
+				"publish no issuer that may vouch for it. Sign an issuer with `-domains %s`, or name "+
+				"one explicitly with -issuer, or record the association at signing time with "+
+				"`ca sign-issuer -trust-domain %s`",
+			len(all), filepath.Join(*rootDir, "issuers"), *domain, *domain, *domain)
 	}
 	for _, c := range issuers {
 		fp := trust.Fingerprint(c)
@@ -163,6 +190,14 @@ func caBundle(args []string) error {
 	fmt.Printf("bundle written to %s\n", *out)
 	fmt.Printf("  domain:   %s\n  epoch:    %d\n  anchors:  %d (1 root, %d issuer)\n  max age:  %s\n",
 		*domain, n, len(anchors), len(issuers), *maxAge)
+	for _, c := range issuers {
+		fmt.Printf("  publish:  %s\n", c.Subject.CommonName)
+	}
+	// Say what was left out and why. A filter that works silently is one nobody
+	// can check, and this one decides whether a sibling can impersonate you.
+	for _, c := range excluded {
+		fmt.Printf("  omitted:  %s (not constrained to %s)\n", c.Subject.CommonName, *domain)
+	}
 	if len(payload.Revoked) > 0 {
 		fmt.Printf("  revoked:  %v\n", payload.Revoked)
 	}
@@ -731,4 +766,76 @@ func orDash(a, b string) string {
 		return b
 	}
 	return "-"
+}
+
+// filterIssuersForDomain keeps issuers whose name constraints permit domain.
+//
+// An issuer with NO permitted-DNS constraint is unconstrained and could issue
+// for anything, so it is not included automatically — including it would
+// reintroduce exactly the problem this filter exists to solve. Name it with
+// -issuer if that is genuinely intended.
+func filterIssuersForDomain(all []*x509.Certificate, domain string, explicit []string,
+	recorded map[string]string) (keep, drop []*x509.Certificate) {
+
+	named := map[string]bool{}
+	for _, n := range explicit {
+		named[strings.TrimSpace(n)] = true
+	}
+	for _, c := range all {
+		fp := strings.TrimPrefix(trust.Fingerprint(c), "sha256:")
+		switch {
+		case named[c.Subject.CommonName]:
+			keep = append(keep, c) // named explicitly by the operator
+		case recorded[fp] != "":
+			// An association recorded at signing time is authoritative: it says
+			// what the operator meant, rather than what a name happens to imply.
+			if recorded[fp] == domain {
+				keep = append(keep, c)
+			} else {
+				drop = append(drop, c)
+			}
+		case permitsDomain(c, domain):
+			keep = append(keep, c) // no record: fall back to the delegation
+		default:
+			drop = append(drop, c)
+		}
+	}
+	return keep, drop
+}
+
+// recordedDomains reads the trust-domain sidecars written by `ca sign-issuer`.
+func recordedDomains(dir string) map[string]string {
+	out := map[string]string{}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".domain") {
+			continue
+		}
+		blob, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		out[strings.TrimSuffix(e.Name(), ".domain")] = strings.TrimSpace(string(blob))
+	}
+	return out
+}
+
+// permitsDomain reports whether a certificate's permitted DNS subtrees cover
+// domain. Matching follows RFC 5280 name-constraint semantics: a permitted
+// subtree covers itself and anything beneath it, at a label boundary.
+func permitsDomain(c *x509.Certificate, domain string) bool {
+	if len(c.PermittedDNSDomains) == 0 {
+		return false
+	}
+	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	for _, p := range c.PermittedDNSDomains {
+		p = strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(p, "."), "."))
+		if d == p || strings.HasSuffix(d, "."+p) {
+			return true
+		}
+	}
+	return false
 }
