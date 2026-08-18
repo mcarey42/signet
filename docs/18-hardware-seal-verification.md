@@ -55,6 +55,32 @@ The general principle: **for a token, measure rather than read the
 specification.** Every claim here is about observed behaviour of a specific
 implementation, because that is the only thing that turned out to be true.
 
+## Fixed alongside: key identity across a rotation
+
+`KeyID()` was `token/label` — a location, not an identity. A key regenerated
+under the same label reported the *same* ID as its predecessor, and
+`RewrapRootKey` treats a matching KeyID as "already moved". So rotating to a
+same-label successor **skipped every blob**: `seal status` showed a clean
+rotation while the material was still wrapped by the key the operator believed
+retired. That is the worst shape a rotation bug can take, because it looks like
+success.
+
+The fingerprint now comes from the key object. Measured on SoftHSM2, deleting
+the key and regenerating it under the identical label:
+
+```
+before   signet/signet-seal/kcv:4470aa
+after    signet/signet-seal/kcv:8328cd
+```
+
+`PKCS11Seal.Unwrap` also now refuses a blob wrapped by a different key, which
+`FileSeal` had always done — previously the wrong key was simply tried and the
+failure surfaced as an opaque decrypt error.
+
+The skip test is deliberately strict: unknown means *not* the same key.
+Re-wrapping something already wrapped correctly is harmless; skipping a rewrap
+that was needed is not.
+
 ## Still to verify on real hardware
 
 SoftHSM2 is a software simulator. It exercises the same code path, which is why
@@ -77,9 +103,12 @@ Worth checking at the same time, because they are cheap once a token is in hand:
 - Non-extractability: `pkcs11_signer_test.go` asserts the token refuses to
   export a key marked `CKA_SENSITIVE`/`CKA_EXTRACTABLE=false`. A device that
   quietly allows it defeats the whole point of hardware custody.
-- Whether `KeyID()` (`token/label`) distinguishes a rotated successor key. It
-  does not today — a successor created under the same label reports an
-  identical KeyID, so `seal status` shows a rotation as complete while material
-  is still wrapped by the old key. Reported by the pentest pass, unfixed.
+- Whether the key fingerprint works on that device. `KeyID()` is now
+  `token/label/<fingerprint>`, where the fingerprint is `CKA_CHECK_VALUE` if the
+  token provides one and `CKA_ID` otherwise. SoftHSM2 provides the check value;
+  a device offering **neither** reports `unidentified`, and rotation then never
+  skips — safe, but it means `seal status` cannot confirm a rotation is
+  complete. `TestHSMKeyIDDistinguishesASuccessorKey` skips with that
+  explanation rather than passing vacuously, so the skip is the signal.
 - PIN handling and lockout behaviour on repeated failures, which differs
   sharply between simulators and real devices.

@@ -22,3 +22,8 @@ func openPKCS11(PKCS11Config) (Seal, error) {
 		"seal: this binary was built without PKCS#11 support; rebuild with -tags pkcs11 " +
 			"(it links a vendor C library through cgo, which the default static build avoids)")
 }
+
+// UnidentifiedKey marks a token key whose material cannot be distinguished from
+// another under the same label. Declared here as well so callers that reason
+// about key identity compile without the pkcs11 build tag.
+const UnidentifiedKey = "unidentified"

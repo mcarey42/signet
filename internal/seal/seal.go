@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Blob is something the seal wrapped. It records which seal and which wrapping
@@ -308,6 +309,22 @@ func (e *Envelope) Open(s Seal, aad []byte) ([]byte, error) {
 // protects are untouched — this is a custody change, not a re-encryption of the
 // store. The previous wrapped form is kept beside it as root.seal.prev so an
 // interrupted ceremony can be reversed by hand.
+// wrappedBy reports whether a blob was wrapped by exactly this seal's key.
+//
+// Unknown means NO. Re-wrapping something already wrapped correctly is
+// harmless; skipping a rewrap that was needed leaves material under a key the
+// operator believes has been retired, which is the failure worth avoiding.
+func wrappedBy(b *Blob, s Seal) bool {
+	if b.Seal != s.Name() {
+		return false
+	}
+	id := s.KeyID()
+	if id == "" || b.KeyID == "" || strings.Contains(id, UnidentifiedKey) {
+		return false
+	}
+	return b.KeyID == id
+}
+
 func RewrapRootKey(from, to Seal, dir string) error {
 	path := filepath.Join(dir, "root.seal")
 	raw, err := os.ReadFile(path)
@@ -319,7 +336,12 @@ func RewrapRootKey(from, to Seal, dir string) error {
 		return fmt.Errorf("seal: %s: %w", path, err)
 	}
 	// Already moved: a resumed ceremony must not fail on its own progress.
-	if b.Seal == to.Name() && b.KeyID == to.KeyID() {
+	//
+	// wrappedBy is deliberately strict. Skipping here on a false match is how a
+	// rotation silently does nothing: the destination reports the same KeyID as
+	// the source, every blob looks already-moved, and `seal status` shows a
+	// clean rotation while the material is still held by the retired key.
+	if wrappedBy(&b, to) {
 		if _, err := to.Unwrap(&b, []byte(rootKeyAAD)); err != nil {
 			return fmt.Errorf("seal: root key claims the new seal but does not open under it: %w", err)
 		}

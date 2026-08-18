@@ -5,6 +5,7 @@ package seal
 import (
 	"bytes"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -167,4 +168,58 @@ func allZero(b []byte) bool {
 		}
 	}
 	return len(b) > 0
+}
+
+// A key regenerated under the same label must be a DIFFERENT key, as far as
+// the seal is concerned.
+//
+// KeyID was token/label — a location, not an identity — so a successor
+// reported the same ID as its predecessor. RewrapRootKey treats a matching
+// KeyID as "already moved", which meant rotating to a same-label successor
+// skipped every blob: `seal status` showed a clean rotation while the material
+// was still wrapped by the key the operator believed retired. That is the worst
+// shape a rotation bug can take, because it looks like success.
+func TestHSMKeyIDDistinguishesASuccessorKey(t *testing.T) {
+	s := hsm(t)
+	p, ok := s.(*PKCS11Seal)
+	if !ok {
+		t.Skipf("not a pkcs11 seal: %T", s)
+	}
+	if p.fingerprint == UnidentifiedKey {
+		t.Skip("this token exposes neither CKA_CHECK_VALUE nor CKA_ID; " +
+			"key identity cannot be established and rotation will never skip")
+	}
+
+	id := s.KeyID()
+	if !strings.Contains(id, p.token) || !strings.Contains(id, p.label) {
+		t.Errorf("KeyID should still locate the key: %q", id)
+	}
+	// The identity must carry something derived from the key, not only its name.
+	if id == p.token+"/"+p.label {
+		t.Fatal("KeyID is still location-only; a successor under this label would be indistinguishable")
+	}
+	t.Logf("key identity: %s", id)
+}
+
+// A blob wrapped by one key must be refused by another, rather than producing
+// an opaque decrypt failure.
+func TestHSMUnwrapRefusesAForeignKeyID(t *testing.T) {
+	s := hsm(t)
+	b, err := s.Wrap([]byte("material"), []byte("purpose"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := s.(*PKCS11Seal); ok && p.fingerprint == UnidentifiedKey {
+		t.Skip("token cannot identify its own key; the check is necessarily inert here")
+	}
+
+	foreign := *b
+	foreign.KeyID = b.KeyID + "-but-not-really"
+	_, err = s.Unwrap(&foreign, []byte("purpose"))
+	if err == nil {
+		t.Fatal("a blob claiming a different wrapping key was accepted")
+	}
+	if !strings.Contains(err.Error(), "wrapped by key") {
+		t.Fatalf("the refusal should name the mismatch, got: %v", err)
+	}
 }

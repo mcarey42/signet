@@ -19,9 +19,11 @@ package seal
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/miekg/pkcs11"
@@ -43,6 +45,9 @@ type PKCS11Seal struct {
 	key     pkcs11.ObjectHandle
 	label   string
 	token   string
+	// fingerprint identifies the key material, resolved once at open time.
+	// See KeyID.
+	fingerprint string
 }
 
 // PKCS#11 permits exactly one C_Initialize per *process*, not per handle, so
@@ -132,7 +137,11 @@ func openPKCS11(cfg PKCS11Config) (Seal, error) {
 		releaseModule(cfg.Module)
 		return nil, err
 	}
-	return &PKCS11Seal{ctx: ctx, module: cfg.Module, session: session, key: key, label: cfg.Label, token: cfg.Token}, nil
+	return &PKCS11Seal{
+		ctx: ctx, module: cfg.Module, session: session, key: key,
+		label: cfg.Label, token: cfg.Token,
+		fingerprint: keyFingerprint(ctx, session, key),
+	}, nil
 }
 
 func findSlot(ctx *pkcs11.Ctx, cfg PKCS11Config) (uint, error) {
@@ -183,8 +192,60 @@ func findKey(ctx *pkcs11.Ctx, session pkcs11.SessionHandle, label string) (pkcs1
 	}
 }
 
-func (p *PKCS11Seal) Name() string  { return "pkcs11" }
-func (p *PKCS11Seal) KeyID() string { return p.token + "/" + p.label }
+func (p *PKCS11Seal) Name() string { return "pkcs11" }
+
+// KeyID identifies the wrapping key ITSELF, not the name it happens to sit
+// under.
+//
+// It used to be token/label — a location, not an identity. Generating a
+// successor key under the same label produced an identical KeyID, with two
+// consequences: rotation SKIPPED every blob (RewrapRootKey treats a matching
+// KeyID as "already moved"), so `seal status` reported a complete rotation
+// while material was still wrapped by the retired key; and Unwrap, which does
+// not otherwise check, would happily try the wrong key.
+//
+// The fingerprint is derived from the key object — its check value where the
+// token provides one, its CKA_ID otherwise — so a successor is distinguishable
+// from its predecessor. Where a token offers neither, the ID says so, and
+// callers treat "unidentified" as "not the same key": re-wrapping unnecessarily
+// is harmless, skipping a rewrap that was needed is not.
+func (p *PKCS11Seal) KeyID() string {
+	return p.token + "/" + p.label + "/" + p.fingerprint
+}
+
+// UnidentifiedKey marks a token key whose material this build cannot
+// distinguish from another under the same label.
+const UnidentifiedKey = "unidentified"
+
+// keyFingerprint asks the token what this key IS.
+//
+// CKA_CHECK_VALUE is the standard key check value — three bytes derived from
+// the key material, so it changes when the key does without ever exposing it.
+// CKA_ID is a per-object identifier. Both are optional in PKCS#11, so each is
+// queried separately: GetAttributeValue fails as a whole if any one attribute
+// in the template is unsupported, which would otherwise lose the one the token
+// does implement.
+func keyFingerprint(ctx *pkcs11.Ctx, session pkcs11.SessionHandle, h pkcs11.ObjectHandle) string {
+	var parts []string
+	for _, a := range []struct {
+		name string
+		attr uint
+	}{
+		{"kcv", pkcs11.CKA_CHECK_VALUE},
+		{"id", pkcs11.CKA_ID},
+	} {
+		got, err := ctx.GetAttributeValue(session, h,
+			[]*pkcs11.Attribute{pkcs11.NewAttribute(a.attr, nil)})
+		if err != nil || len(got) != 1 || len(got[0].Value) == 0 {
+			continue
+		}
+		parts = append(parts, a.name+":"+hex.EncodeToString(got[0].Value))
+	}
+	if len(parts) == 0 {
+		return UnidentifiedKey
+	}
+	return strings.Join(parts, ",")
+}
 
 func (p *PKCS11Seal) Close() error {
 	p.mu.Lock()
@@ -260,6 +321,17 @@ func (p *PKCS11Seal) Unwrap(b *Blob, aad []byte) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// A blob wrapped by a different key must not be handed to this one. FileSeal
+	// has always checked; this did not, so after a rotation that reused a label
+	// the wrong key was tried and the failure surfaced as an opaque decrypt
+	// error rather than the plain statement of what went wrong.
+	if b.KeyID != "" && p.fingerprint != UnidentifiedKey && b.KeyID != p.KeyID() {
+		return nil, fmt.Errorf(
+			"seal: this blob was wrapped by key %s and this token holds %s. If a key was "+
+				"regenerated under the same label, the material wrapped by its predecessor is "+
+				"still wrapped by the predecessor and needs the old key to move",
+			b.KeyID, p.KeyID())
+	}
 	if len(b.Nonce) != gcmNonceLen {
 		return nil, fmt.Errorf(
 			"seal: this blob carries a %d-byte GCM nonce, expected %d. Blobs written before the "+
