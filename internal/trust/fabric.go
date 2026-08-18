@@ -231,6 +231,15 @@ func (p *Payload) VerifyCert(cert *x509.Certificate, extra []*x509.Certificate, 
 func chainUsesPublishedIssuers(chains [][]*x509.Certificate, anchor *Anchor, published map[string]bool) error {
 	var lastErr error
 	for _, chain := range chains {
+		// A length-1 chain means the presented certificate IS the anchor —
+		// Go returns that when the leaf is itself in the root pool. There are
+		// no intermediates to check, and slicing [1:0] would panic.
+		if len(chain) < 2 {
+			lastErr = errors.New(
+				"the presented certificate is itself an anchor, not a leaf issued beneath one. " +
+					"An anchor vouches for others; it does not vouch for itself as an identity")
+			continue
+		}
 		ok := true
 		// Skip the leaf (index 0) and the anchor itself (last).
 		for _, c := range chain[1 : len(chain)-1] {

@@ -336,18 +336,59 @@ func (k *Kernel) DestroySecret(ctx context.Context, s Session, path string) erro
 }
 
 // PutSecretMetadata writes the policy attached to a secret.
-func (k *Kernel) PutSecretMetadata(ctx context.Context, s Session, path string, custom map[string]string, maxVersions uint32, casRequired bool) error {
+func (k *Kernel) PutSecretMetadata(ctx context.Context, s Session, path string, custom map[string]string, maxVersions uint32, casRequired *bool) error {
 	if err := ValidatePath(path); err != nil {
 		return err
 	}
 	if err := k.authorize(s, VerbWrite, path); err != nil {
 		return err
 	}
+	// Weakening a protection is a destructive act, so it needs destructive
+	// authority. Lowering MaxVersions makes the next write erase history;
+	// clearing CASRequired removes the guard against a blind overwrite. Both
+	// were reachable with `write` alone, which let a writer with no delete
+	// authority destroy versions it could not delete directly.
+	if maxVersions > 0 || (casRequired != nil && !*casRequired) {
+		if err := k.needsDeleteToWeaken(ctx, s, path, maxVersions, casRequired); err != nil {
+			return err
+		}
+	}
 	_, err := k.prop.Propose(ctx, &op.PutSecretMeta{
 		Header: k.header(s.Principal), Path: path,
 		CustomMetadata: custom, MaxVersions: maxVersions, CASRequired: casRequired,
 	})
 	return err
+}
+
+// needsDeleteToWeaken requires delete authority when a metadata write would
+// lower a protection rather than raise one. Raising stays a plain write.
+func (k *Kernel) needsDeleteToWeaken(ctx context.Context, s Session, path string,
+	maxVersions uint32, casRequired *bool) error {
+
+	var cur SecretMeta
+	var found bool
+	if err := k.store.View(func(tx *store.Tx) error {
+		m, ok, err := loadSecretMeta(tx, path)
+		cur, found = m, ok
+		return err
+	}); err != nil {
+		return err
+	}
+	if !found {
+		return nil // nothing to weaken yet
+	}
+	weakens := (maxVersions > 0 && cur.MaxVersions > 0 && maxVersions < cur.MaxVersions) ||
+		(casRequired != nil && !*casRequired && cur.CASRequired)
+	if !weakens {
+		return nil
+	}
+	if err := k.authorize(s, VerbDelete, path); err != nil {
+		return fmt.Errorf(
+			"this metadata change would weaken a protection on %s, which needs delete authority "+
+				"there: lowering max_versions makes the next write erase history, and clearing "+
+				"cas_required removes the guard against a blind overwrite: %w", path, err)
+	}
+	return nil
 }
 
 // PutSecret authorizes, then proposes. The CAS check itself runs inside Apply,

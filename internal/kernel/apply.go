@@ -187,11 +187,46 @@ func applyCreateSession(tx *store.Tx, o *op.CreateSession) op.Result {
 	return op.Result{ID: o.ID}
 }
 
+// Revoking a session is either standing yourself down or cutting someone else
+// off. The first is always allowed; the second is an administrative act.
+//
+// This had no check at all. The only caller today is revoke-self, which passes
+// the caller's own token — so the HTTP surface constrained it and the Op did
+// not. Invariants in this system live inside Apply precisely so they hold for
+// callers that do not exist yet, and this one was missing.
 func applyRevokeSession(tx *store.Tx, o *op.RevokeSession) op.Result {
+	if o.TokenHash == "" {
+		return op.Result{Err: errors.New("revoke: missing token hash")}
+	}
+	raw, ok, err := tx.Get(store.BucketSessions, o.TokenHash)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if !ok {
+		// Already gone. Idempotent by design: a retried revocation must not
+		// fail, and reporting "no such session" would also be an oracle for
+		// whether a given token hash is live.
+		return op.Result{}
+	}
+	var sess Session
+	if err := json.Unmarshal(raw, &sess); err != nil {
+		return op.Result{Err: err}
+	}
+	if o.Actor != "" && o.Actor != sess.Principal {
+		ok, err := HasAuthority(tx, o.Actor, VerbAdmin, "/", o.AtSec)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if !ok {
+			return op.Result{Err: fmt.Errorf(
+				"revoke: %s cannot revoke another principal's session without admin authority at /. "+
+					"A principal may always revoke their own", o.Actor)}
+		}
+	}
 	if err := tx.Delete(store.BucketSessions, o.TokenHash); err != nil {
 		return op.Result{Err: err}
 	}
-	return op.Result{}
+	return op.Result{Subject: string(sess.Principal)}
 }
 
 // Registering a trust anchor decides whose signatures Signet will believe, so
@@ -361,7 +396,19 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 	case *op.PutPrincipal:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
 	case *op.PutBinding:
-		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Scope
+		// Role and recipient, not just the scope. Recording the scope alone
+		// made a self-grant of domain-admin at / byte-identical to a kv-reader
+		// grant at / — an attacker could append the most serious grant in the
+		// system honestly, get witnessed with no conflict, and the log would
+		// not distinguish it from the most trivial one.
+		r.Actor, r.AtSec = v.Actor, v.AtSec
+		r.Subject = fmt.Sprintf("%s to %s at %s", v.Role, v.Subject, v.Scope)
+		if v.ActivationRequired {
+			r.Subject += " (activation required)"
+		}
+		if v.NotAfter != 0 {
+			r.Subject += fmt.Sprintf(" until %d", v.NotAfter)
+		}
 	case *op.PutSecret:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Path
 	case *op.VersionAction:
@@ -373,7 +420,10 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 	case *op.CreateSession:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, string(v.Principal)
 	case *op.RevokeSession:
-		r.Actor, r.AtSec = v.Actor, v.AtSec
+		// The subject is filled in by Apply, which is the only place that knows
+		// whose session a token hash belonged to. Without it a revocation was
+		// unattributable: you could see that one happened and not to whom.
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, res.Subject
 	}
 	return json.Marshal(r)
 }

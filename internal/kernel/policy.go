@@ -92,12 +92,9 @@ func HasAuthority(tx *store.Tx, subject op.ID, v Verb, path string, nowSec int64
 			}
 			metrics.AuthzActivationsScanned.Observe(float64(len(acts)))
 		}
-		for i := range acts {
-			a := &acts[i]
-			if a.Binding == b.ID && a.Live(nowSec) {
-				allowed = true
-				return false
-			}
+		if activationFor(acts, b.ID, nowSec) != nil {
+			allowed = true
+			return false
 		}
 		return true
 	})

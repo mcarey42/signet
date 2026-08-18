@@ -81,6 +81,12 @@ func applyPutSecret(tx *store.Tx, o *op.PutSecret) op.Result {
 
 	// Trim history to MaxVersions. Trimming destroys — the value is gone, not
 	// merely hidden — so it is recorded that way.
+	//
+	// The authority to reach this point is `write`. That is correct for adding
+	// a version and wrong for removing one, which is why LOWERING MaxVersions
+	// requires `delete` (see applyPutSecretMeta's caller): otherwise a writer
+	// with no delete authority sets max_versions=1, writes once, and erases the
+	// history it was never allowed to touch.
 	if m.MaxVersions > 0 {
 		for uint32(len(liveVersions(m))) > m.MaxVersions {
 			oldest := lowestVersion(m)
@@ -187,7 +193,12 @@ func applyPutSecretMeta(tx *store.Tx, o *op.PutSecretMeta) op.Result {
 	if o.MaxVersions > 0 {
 		m.MaxVersions = o.MaxVersions
 	}
-	m.CASRequired = o.CASRequired
+	// Absent means unchanged, matching MaxVersions above. Only an explicit
+	// value moves a protection, and turning one OFF needs delete authority —
+	// see the write path, where lowering MaxVersions is gated the same way.
+	if o.CASRequired != nil {
+		m.CASRequired = *o.CASRequired
+	}
 	m.UpdatedSec = o.AtSec
 	if err := saveSecretMeta(tx, m); err != nil {
 		return op.Result{Err: err}

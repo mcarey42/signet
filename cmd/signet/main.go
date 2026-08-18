@@ -607,6 +607,7 @@ func cmdServe(args []string) error {
 	nodeID := fs.String("node-id", "", "which issuing authority is this node's own, when the domain has several (see `signet ca issuers`); not the consensus identity")
 	domain := fs.String("domain", "", "this trust domain's name, e.g. home.example.net (named in audit checkpoints)")
 	metricsListen := fs.String("metrics-listen", "", "serve Prometheus metrics on this address, e.g. 127.0.0.1:9101 (off by default)")
+	maxBody := fs.Int64("max-body-bytes", 8<<20, "largest request body accepted on any route")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
 	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
@@ -650,9 +651,22 @@ func cmdServe(args []string) error {
 	sshca.New(k, sshca.Config{Mount: *sshMount}).Register(mux)
 
 	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           metrics.Middleware(mux),
+		Addr: *listen,
+		// One body cap for every route, applied before any handler runs.
+		//
+		// The login route decoded an unbounded body BEFORE checking any
+		// credential — the only unauthenticated write-shaped route in the
+		// server, and the only one that capped nothing. A 48MB body cost
+		// roughly 224MB of allocation to reach a 403. Capping per-handler
+		// would mean remembering to do it on every route added later; capping
+		// here means a new route is bounded by default.
+		Handler: http.MaxBytesHandler(metrics.Middleware(mux), *maxBody),
+		// Timeouts. Without them a client can hold connections open
+		// indefinitely and exhaust the server with no traffic at all.
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      120 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// Metrics live on their own listener, off by default. An exposition

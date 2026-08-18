@@ -198,7 +198,12 @@ type PutSecretMeta struct {
 	Path           string            `json:"path"`
 	CustomMetadata map[string]string `json:"custom_metadata,omitempty"`
 	MaxVersions    uint32            `json:"max_versions,omitempty"`
-	CASRequired    bool              `json:"cas_required,omitempty"`
+	// CASRequired is a POINTER so that "absent" and "false" are distinguishable.
+	// As a bare bool, a metadata write that simply did not mention it cleared
+	// it — and the primary consumer (External Secrets) sends exactly that
+	// shape, so a routine push silently removed a protection an admin had set.
+	// Removing a safeguard must be something you ask for.
+	CASRequired *bool `json:"cas_required,omitempty"`
 }
 
 // PutCA installs a certificate authority. The material carries the root
@@ -387,6 +392,10 @@ type Result struct {
 	ID      ID
 	Version uint64
 	Err     error
+	// Subject is what the operation turned out to act on, when only Apply can
+	// know it — revoking a session by token hash, for instance, learns whose
+	// session it was. The audit record reads it so the event is attributable.
+	Subject string
 }
 
 type envelope struct {

@@ -189,7 +189,7 @@ func TestCASRequiredForcesCallersToDeclareIntent(t *testing.T) {
 	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 	const p = "/secrets/app"
-	mustApply(t, s, 10, &op.PutSecretMeta{Header: op.Header{AtSec: 100}, Path: p, CASRequired: true})
+	mustApply(t, s, 10, &op.PutSecretMeta{Header: op.Header{AtSec: 100}, Path: p, CASRequired: boolPtr(true)})
 
 	if res := apply(t, s, 11, &op.PutSecret{Header: op.Header{AtSec: 101}, Path: p, Data: map[string]string{"k": "v"}}); res.Err == nil {
 		t.Error("a blind write was accepted where check-and-set is required")
@@ -242,3 +242,5 @@ func TestListReturnsImmediateChildren(t *testing.T) {
 		t.Errorf("leaf listing = %v, want [grafana litellm]", keys)
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }

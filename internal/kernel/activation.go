@@ -81,6 +81,18 @@ func putActivation(tx *store.Tx, a *Activation) error {
 	return tx.Put(store.BucketActivation, activationKey(a.Subject, a.ID), blob)
 }
 
+// activationFor returns the live activation over a binding, or nil. Shared by
+// the online authorization path and the offline minting path so the two cannot
+// drift apart — which is exactly how they came to disagree.
+func activationFor(acts []Activation, binding op.ID, nowSec int64) *Activation {
+	for i := range acts {
+		if acts[i].Binding == binding && acts[i].Live(nowSec) {
+			return &acts[i]
+		}
+	}
+	return nil
+}
+
 // findBinding locates one of a subject's bindings by ID.
 func findBinding(tx *store.Tx, subject, id op.ID) (*Binding, error) {
 	bs, err := LoadBindings(tx, subject)

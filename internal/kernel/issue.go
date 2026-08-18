@@ -208,6 +208,10 @@ func (k *Kernel) filterRoles(tx *store.Tx, s Session, req IssueRequest, now time
 	}
 	seen := map[string]bool{}
 	var roles []string
+	var (
+		acts     []Activation
+		haveActs bool
+	)
 	for _, b := range bindings {
 		if b.NotAfter != 0 && now.Unix() >= b.NotAfter {
 			continue
@@ -215,6 +219,37 @@ func (k *Kernel) filterRoles(tx *store.Tx, s Session, req IssueRequest, now time
 		// The credential speaks for a scope; only bindings covering it apply.
 		if !ScopeCovers(b.Scope, req.Scope) {
 			continue
+		}
+		// Eligibility is not possession here either — and this is where it
+		// matters most. An offline credential is checked by a relying party
+		// that never asks us anything, so a PAM-gated role embedded without a
+		// live activation is authority nobody can withdraw for the life of the
+		// token. HasAuthority enforced this and this path did not, which meant
+		// the bypass landed precisely on the credential class PAM most needs to
+		// cover.
+		if b.ActivationRequired {
+			if !haveActs {
+				var err error
+				if acts, err = LoadActivations(tx, s.Principal); err != nil {
+					return nil, 0, err
+				}
+				haveActs = true
+			}
+			live := activationFor(acts, b.ID, now.Unix())
+			if live == nil {
+				continue
+			}
+			// JIT-on-JIT, again: a credential may not outlive the elevation it
+			// was minted under. Without this clamp a 15-minute token issued
+			// against a window with one minute left would carry the elevated
+			// role for fourteen minutes after the elevation ended.
+			remaining := time.Unix(live.Expiry, 0).Sub(now)
+			if remaining <= 0 {
+				continue
+			}
+			if remaining < ttl {
+				ttl = remaining
+			}
 		}
 		policy, err := loadRolePolicy(tx, b.Role)
 		if err != nil {
@@ -240,8 +275,13 @@ func (k *Kernel) filterRoles(tx *store.Tx, s Session, req IssueRequest, now time
 	// diffable.
 	sort.Strings(roles)
 	// A session never outlives itself.
+	//
+	// Measured against `now` rather than the wall clock: this function is handed
+	// a time so its decisions are deterministic and testable, and reaching past
+	// that for time.Now() silently reintroduces the nondeterminism the parameter
+	// exists to remove.
 	if s.Expiry != 0 {
-		if max := time.Until(time.Unix(s.Expiry, 0)); max > 0 && max < ttl {
+		if max := time.Unix(s.Expiry, 0).Sub(now); max > 0 && max < ttl {
 			ttl = max
 		}
 	}

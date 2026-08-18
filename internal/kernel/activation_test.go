@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/store"
@@ -482,4 +483,124 @@ func TestPrincipalMayAlwaysKillTheirOwnActivation(t *testing.T) {
 			t.Fatal("access survived the principal's own kill")
 		}
 	})
+}
+
+// PAM must hold for OFFLINE credentials too, which is where it matters most.
+//
+// filterRoles decides which roles get embedded in a JWT or SSH certificate.
+// It checked NotAfter, scope, tier and AMR — but not ActivationRequired. So a
+// principal merely ELIGIBLE for a role got that role baked into a bearer
+// credential with no live activation, while the online path correctly denied
+// the same authority. The bypass landed on exactly the credential class no
+// relying party re-checks with us.
+func TestOfflineCredentialsRespectActivation(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		id := bindPAM(t, tx, Binding{ID: "b-pam", Subject: alice, Role: "kv-admin",
+			Scope: "/secrets", ActivationRequired: true})
+		s := Session{Principal: alice, Expiry: 0}
+		req := IssueRequest{Scope: "/secrets/app", TTL: 15 * time.Minute}
+		now := time.Unix(1000, 0)
+
+		// Eligible only: the role must not be embeddable.
+		roles, _, err := (&Kernel{}).filterRoles(tx, s, req, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(roles) != 0 {
+			t.Fatalf("an un-activated PAM role was embedded in an offline credential: %v", roles)
+		}
+
+		// Activated: now it may be carried.
+		if res := requestAct(tx, alice, id, 1000, 600, nil, 1000); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		roles, ttl, err := (&Kernel{}).filterRoles(tx, s, req, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(roles) != 1 || roles[0] != "kv-admin" {
+			t.Fatalf("an active PAM role should be carried, got %v", roles)
+		}
+
+		// And the credential must not outlive the elevation. A 15-minute token
+		// minted against a 10-minute window would carry the elevated role for
+		// five minutes after the elevation ended, with nobody to ask.
+		if ttl > 600*time.Second {
+			t.Fatalf("credential TTL %s outlives the activation window (600s)", ttl)
+		}
+
+		// Once killed, it stops being embeddable again.
+		bindPAM(t, tx, Binding{ID: "b-carol", Subject: carol, Role: "domain-admin", Scope: "/"})
+		if res := decide(tx, carol, alice, "act-1", op.ActivationKill, 1100); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		roles, _, err = (&Kernel{}).filterRoles(tx, s, req, time.Unix(1100, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(roles) != 0 {
+			t.Fatalf("a killed activation still yielded an offline role: %v", roles)
+		}
+	})
+}
+
+// Revoking a session is self-service or an administrative act, never a free
+// action against anyone whose token hash you happen to know.
+func TestRevokeSessionRequiresAuthority(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		sess := Session{ID: "s1", TokenHash: "hash-1", Principal: alice, Expiry: 1 << 40}
+		blob, _ := jsonMarshalB(sess)
+		if err := tx.Put(store.BucketSessions, "hash-1", blob); err != nil {
+			t.Fatal(err)
+		}
+
+		// bob holds nothing and must not be able to cut alice off.
+		res := applyRevokeSession(tx, &op.RevokeSession{
+			Header: op.Header{Actor: bob, AtSec: 1000}, TokenHash: "hash-1"})
+		if res.Err == nil {
+			t.Fatal("an unrelated principal revoked another's session")
+		}
+		if _, ok, _ := tx.Get(store.BucketSessions, "hash-1"); !ok {
+			t.Fatal("the session was deleted despite the refusal")
+		}
+
+		// alice may always revoke her own, and the record says whose it was.
+		res = applyRevokeSession(tx, &op.RevokeSession{
+			Header: op.Header{Actor: alice, AtSec: 1000}, TokenHash: "hash-1"})
+		if res.Err != nil {
+			t.Fatalf("a principal could not revoke their own session: %v", res.Err)
+		}
+		if res.Subject != string(alice) {
+			t.Fatalf("the revocation is unattributable: subject = %q", res.Subject)
+		}
+
+		// Revoking again is idempotent rather than an error, and does not
+		// reveal whether the hash was ever live.
+		if res := applyRevokeSession(tx, &op.RevokeSession{
+			Header: op.Header{Actor: bob, AtSec: 1000}, TokenHash: "hash-1"}); res.Err != nil {
+			t.Fatalf("a repeated revocation should be idempotent: %v", res.Err)
+		}
+	})
+}
+
+// An audit record must distinguish the most serious grant in the system from
+// the most trivial one.
+func TestBindingAuditRecordNamesRoleAndRecipient(t *testing.T) {
+	admin, _ := NewAuditRecord(1, 1, &op.PutBinding{
+		Header:  op.Header{Actor: alice, AtSec: 1000},
+		Subject: bob, Role: "domain-admin", Scope: "/",
+	}, op.Result{})
+	reader, _ := NewAuditRecord(1, 1, &op.PutBinding{
+		Header:  op.Header{Actor: alice, AtSec: 1000},
+		Subject: bob, Role: "kv-reader", Scope: "/",
+	}, op.Result{})
+
+	if string(admin) == string(reader) {
+		t.Fatal("granting domain-admin at / is indistinguishable from kv-reader at / in the audit log")
+	}
+	for _, want := range []string{"domain-admin", string(bob)} {
+		if !strings.Contains(string(admin), want) {
+			t.Fatalf("the record should name %q: %s", want, admin)
+		}
+	}
 }

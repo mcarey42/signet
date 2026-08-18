@@ -683,7 +683,9 @@ func (h *Handler) writeMetadata(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		CustomMetadata map[string]string `json:"custom_metadata"`
 		MaxVersions    uint32            `json:"max_versions"`
-		CASRequired    bool              `json:"cas_required"`
+		// Pointer, so a request that does not mention cas_required leaves it
+		// alone rather than clearing it. ESO sends exactly that shape.
+		CASRequired *bool `json:"cas_required"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request body")

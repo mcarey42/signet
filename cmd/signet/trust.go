@@ -823,17 +823,25 @@ func recordedDomains(dir string) map[string]string {
 	return out
 }
 
-// permitsDomain reports whether a certificate's permitted DNS subtrees cover
-// domain. Matching follows RFC 5280 name-constraint semantics: a permitted
-// subtree covers itself and anything beneath it, at a label boundary.
+// permitsDomain reports whether a certificate is constrained to EXACTLY this
+// trust domain.
+//
+// Exact match, deliberately, even though RFC 5280 name constraints are subtree
+// semantics — because this predicate is not answering "may this issuer sign
+// that DNS name". It is answering "is this issuer one of THIS trust domain's
+// issuers", and the verifier decides trust-domain membership with exact
+// equality (trust.BelongsTo). Any looser rule here than there is a hole: the
+// first version of this filter used suffix matching, which silently published
+// an issuer constrained to `example.net` into `gcp.example.net`'s bundle and
+// let it assert gcp identities — the very impersonation the filter exists to
+// prevent, reintroduced by the filter itself.
+//
+// This is only a fallback for issuers signed before `-trust-domain` existed.
+// The recorded association is authoritative when present.
 func permitsDomain(c *x509.Certificate, domain string) bool {
-	if len(c.PermittedDNSDomains) == 0 {
-		return false
-	}
 	d := strings.ToLower(strings.TrimSuffix(domain, "."))
 	for _, p := range c.PermittedDNSDomains {
-		p = strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(p, "."), "."))
-		if d == p || strings.HasSuffix(d, "."+p) {
+		if strings.ToLower(strings.TrimPrefix(strings.TrimSuffix(p, "."), ".")) == d {
 			return true
 		}
 	}
