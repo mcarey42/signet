@@ -50,6 +50,7 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet ca ...                                  CA ceremonies (see: signet ca help)
   signet trust ...                               trust bundles (see: signet trust help)
   signet audit ...                               tamper-evident history (see: signet audit help)
+  signet pam ...                                 privileged access (see: signet pam help)
 `
 
 func main() {
@@ -73,6 +74,8 @@ func main() {
 		err = cmdTrust(os.Args[2:])
 	case "audit":
 		err = cmdAudit(os.Args[2:])
+	case "pam":
+		err = cmdPAM(os.Args[2:])
 	case "ca":
 		err = cmdCA(os.Args[2:])
 	case "-h", "--help", "help":
@@ -99,9 +102,18 @@ type GenesisConfig struct {
 		Type string `json:"type"`
 	} `json:"principals"`
 	Bindings []struct {
-		Subject string `json:"subject"` // principal path
-		Role    string `json:"role"`
-		Scope   string `json:"scope"`
+		Subject  string `json:"subject"` // principal path
+		Role     string `json:"role"`
+		Scope    string `json:"scope"`
+		NotAfter int64  `json:"not_after,omitempty"`
+		// Eligibility rather than possession: the subject may ask for this
+		// authority but does not hold it until activated (docs/13).
+		ActivationRequired bool     `json:"activation_required,omitempty"`
+		MaxActivationSec   int64    `json:"max_activation_sec,omitempty"`
+		ApprovalRequired   bool     `json:"approval_required,omitempty"`
+		MinApprovers       int      `json:"min_approvers,omitempty"`
+		StepUpAMR          []string `json:"step_up_amr,omitempty"`
+		StepUpMaxAgeSec    int64    `json:"step_up_max_age_sec,omitempty"`
 	} `json:"bindings"`
 	// Issuers are pinned attestation trust anchors. The key set is referenced
 	// by file rather than inlined so it can be mounted separately and rotated
@@ -512,10 +524,19 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 		if err != nil {
 			return fmt.Errorf("config: binding subject %s: %w", b.Subject, err)
 		}
-		if _, err := k.PutBinding(ctx, actor, subj.ID, b.Role, b.Scope, 0); err != nil {
+		if _, err := k.PutBindingSpec(ctx, actor, kernel.Binding{
+			Subject: subj.ID, Role: b.Role, Scope: b.Scope, NotAfter: b.NotAfter,
+			ActivationRequired: b.ActivationRequired, MaxActivationSec: b.MaxActivationSec,
+			ApprovalRequired: b.ApprovalRequired, MinApprovers: b.MinApprovers,
+			StepUpAMR: b.StepUpAMR, StepUpMaxAgeSec: b.StepUpMaxAgeSec,
+		}); err != nil {
 			return fmt.Errorf("config: binding %s@%s: %w", b.Role, b.Scope, err)
 		}
-		fmt.Fprintf(os.Stderr, "  binding %s -> %s at %s\n", b.Subject, b.Role, b.Scope)
+		how := "holds"
+		if b.ActivationRequired {
+			how = "eligible for"
+		}
+		fmt.Fprintf(os.Stderr, "  binding %s %s %s at %s\n", b.Subject, how, b.Role, b.Scope)
 	}
 	for _, i := range cfg.Issuers {
 		jwks, err := os.ReadFile(i.JWKSFile)

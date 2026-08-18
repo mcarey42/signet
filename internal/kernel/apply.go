@@ -65,6 +65,10 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyPutTrustBundle(tx, v)
 	case *op.PutWitness:
 		return applyPutWitness(tx, v)
+	case *op.RequestActivation:
+		return applyRequestActivation(tx, v)
+	case *op.ActivationAction:
+		return applyActivationAction(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -142,7 +146,13 @@ func applyPutBinding(tx *store.Tx, o *op.PutBinding) op.Result {
 		}
 	}
 
-	b := Binding{ID: o.ID, Subject: o.Subject, Role: o.Role, Scope: o.Scope, Grantor: o.Grantor, NotAfter: o.NotAfter}
+	b := Binding{
+		ID: o.ID, Subject: o.Subject, Role: o.Role, Scope: o.Scope,
+		Grantor: o.Grantor, NotAfter: o.NotAfter,
+		ActivationRequired: o.ActivationRequired, MaxActivationSec: o.MaxActivationSec,
+		ApprovalRequired: o.ApprovalRequired, MinApprovers: o.MinApprovers,
+		StepUpAMR: o.StepUpAMR, StepUpMaxAgeSec: o.StepUpMaxAgeSec,
+	}
 	blob, err := json.Marshal(b)
 	if err != nil {
 		return op.Result{Err: err}
@@ -334,6 +344,10 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("%s epoch %d", v.Domain, v.Epoch)
 	case *op.PutWitness:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, "witness "+v.Domain
+	case *op.RequestActivation:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("activation %s: %s", v.ID, v.Reason)
+	case *op.ActivationAction:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("activation %s %s", v.Verb, v.ID)
 	case *op.PutCA:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutPKIRole:

@@ -184,6 +184,45 @@ DPoPReplay       { jti; exp }                                           # AG-3 r
    (challenge carries the request hash) — no relayed-touch approval of a
    different request (extends E-01 AT-5 to activations).
 
+### Built: activation API (2026-08-17, milestone 5b)
+
+`internal/kernel/activation.go`; `signet pam eligible | activate | pending |
+approve | deny | kill`; proven in `test/pam/run.sh`.
+
+The four semantics above are enforced **inside `Apply`**, not in a caller that
+could be bypassed, and each has a test named after the failure it prevents:
+
+- **Eligibility is not possession.** `HasAuthority` skips a binding with
+  `activation_required` unless a live activation references it, and re-checks on
+  every call — so an activation expiring or being killed ends the access at the
+  next renewal with nothing to sweep.
+- **JIT-on-JIT.** Expiry is `min(requested, MaxActivationSec, binding.NotAfter)`.
+- **Approval re-validates at grant time.** If eligibility lapsed or was removed
+  while the request sat in the queue, approving *denies* it and records why.
+- **Nobody approves their own request** — including a domain admin who could
+  otherwise grant it outright. Approving is a form of granting, so an approver
+  must additionally hold `admin` at the binding's scope, and the same principal
+  cannot supply two of the approvals `min_approvers` requires.
+
+Two smaller decisions worth recording:
+
+**Activations cannot be stacked.** One live or pending activation per binding.
+Without that, a requester could open overlapping windows and hold the authority
+continuously while every individual record looked bounded.
+
+**Step-up is judged from facts carried in the Op**, not looked up during
+`Apply` — `Apply` is pure, so it cannot go and read a session, and every replica
+must reach the same verdict. The requester's session supplies its own `amr` and
+`auth_time` at propose time; the caller cannot assert them.
+
+**Honest limit on step-up.** What is enforced today is *which* authentication
+methods the session carries and *how recently* it authenticated. That is real
+and worth having, but it is not the challenge-bound assertion docs/13 semantic 4
+describes: there is no hardware authenticator yet, so nothing signs a challenge
+carrying the request hash. The structure is in place for one to slot in; until
+it does, a relayed-touch approval of a *different* request is not prevented by
+cryptography here. Gated on E-05 and the agent.
+
 ## KV dialect authorization (E-13 F8 — the actual v1 success path)
 
 The first success criterion is "ESO reads a secret," so it is specified:

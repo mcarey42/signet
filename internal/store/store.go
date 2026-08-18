@@ -32,6 +32,7 @@ const (
 	BucketSSHRoles   = "ssh_roles"   // name -> ssh signing role
 	BucketTrust      = "trust"       // domain -> root-signed trust bundle
 	BucketWitness    = "witness"     // domain -> what we have witnessed of its audit chain
+	BucketActivation = "activations" // "<subjectID>/<activationID>" -> PAM activation
 	BucketMeta       = "meta"
 )
 
@@ -39,7 +40,8 @@ var allBuckets = []string{
 	BucketPrincipals, BucketPathIndex, BucketBindings, BucketSecretMeta, BucketSecretData,
 	BucketSessions, BucketIssuers, BucketMappings,
 	BucketCA, BucketPKIRoles, BucketIssuance,
-	BucketRolePolicy, BucketKeys, BucketSSHRoles, BucketTrust, BucketWitness, BucketAudit, BucketMeta,
+	BucketRolePolicy, BucketKeys, BucketSSHRoles, BucketTrust, BucketWitness,
+	BucketActivation, BucketAudit, BucketMeta,
 }
 
 var ErrReadOnly = errors.New("store: write attempted in a read-only transaction")

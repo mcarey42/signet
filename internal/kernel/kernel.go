@@ -387,13 +387,24 @@ func (k *Kernel) PutPrincipal(ctx context.Context, actor op.ID, id op.ID, path, 
 // PutBinding grants a role. Delegation-only-narrows is enforced inside Apply,
 // against the serialized state, not here.
 func (k *Kernel) PutBinding(ctx context.Context, grantor, subject op.ID, role, scope string, notAfter int64) (op.ID, error) {
+	return k.PutBindingSpec(ctx, grantor, Binding{
+		Subject: subject, Role: role, Scope: scope, NotAfter: notAfter,
+	})
+}
+
+// PutBindingSpec grants a binding with its full shape, including whether it is
+// held outright or merely offered for activation.
+func (k *Kernel) PutBindingSpec(ctx context.Context, grantor op.ID, b Binding) (op.ID, error) {
 	id, err := newID()
 	if err != nil {
 		return "", err
 	}
 	res, err := k.prop.Propose(ctx, &op.PutBinding{
-		Header: k.header(grantor), ID: id, Subject: subject,
-		Role: role, Scope: scope, Grantor: grantor, NotAfter: notAfter,
+		Header: k.header(grantor), ID: id, Subject: b.Subject,
+		Role: b.Role, Scope: b.Scope, Grantor: grantor, NotAfter: b.NotAfter,
+		ActivationRequired: b.ActivationRequired, MaxActivationSec: b.MaxActivationSec,
+		ApprovalRequired: b.ApprovalRequired, MinApprovers: b.MinApprovers,
+		StepUpAMR: b.StepUpAMR, StepUpMaxAgeSec: b.StepUpMaxAgeSec,
 	})
 	if err != nil {
 		return "", err

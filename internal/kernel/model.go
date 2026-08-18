@@ -16,12 +16,79 @@ type Principal struct {
 
 // Binding grants Role at Scope to Subject. Scope inherits downward.
 type Binding struct {
-	ID       op.ID  `json:"id"`
-	Subject  op.ID  `json:"subject"`
-	Role     string `json:"role"`
-	Scope    string `json:"scope"`
-	Grantor  op.ID  `json:"grantor"`
-	NotAfter int64  `json:"not_after,omitempty"` // 0 = no expiry
+	ID      op.ID  `json:"id"`
+	Subject op.ID  `json:"subject"`
+	Role    string `json:"role"`
+	Scope   string `json:"scope"`
+	Grantor op.ID  `json:"grantor"`
+	// NotAfter makes a grant just-in-time: after it, the binding simply stops
+	// being honored. No sweep, no revocation — the authority was never held
+	// past T, so nothing needs taking away (docs/13).
+	NotAfter int64 `json:"not_after,omitempty"` // 0 = no expiry
+
+	// ActivationRequired splits eligibility from possession: the subject may
+	// ask for this authority but does not hold it until an activation is live.
+	// This is the PAM half of docs/13 — standing access is what an attacker
+	// inherits along with a session, and eligibility is not standing access.
+	ActivationRequired bool `json:"activation_required,omitempty"`
+	// MaxActivationSec bounds how long one activation may last. Zero means the
+	// domain default; an activation is always additionally clamped to NotAfter.
+	MaxActivationSec int64 `json:"max_activation_sec,omitempty"`
+	// ApprovalRequired makes activation somebody else's decision. MinApprovers
+	// defaults to 1, and the requester never counts toward it.
+	ApprovalRequired bool `json:"approval_required,omitempty"`
+	MinApprovers     int  `json:"min_approvers,omitempty"`
+	// StepUpAMR lists authentication methods the requester's session must carry
+	// to activate — "the password you already typed" is not a second factor for
+	// privilege elevation. StepUpMaxAgeSec additionally requires that
+	// authentication to be recent, so a long-lived session cannot coast on an
+	// elevation it performed hours ago.
+	StepUpAMR       []string `json:"step_up_amr,omitempty"`
+	StepUpMaxAgeSec int64    `json:"step_up_max_age_sec,omitempty"`
+}
+
+// ActivationState is where an activation sits in its short life.
+type ActivationState string
+
+const (
+	// ActivationPending is requested but not yet granted: eligible, waiting.
+	ActivationPending ActivationState = "pending"
+	// ActivationActive is live and conferring authority, until Expiry.
+	ActivationActive ActivationState = "active"
+	ActivationDenied ActivationState = "denied"
+	// ActivationKilled was cut short. Kept rather than deleted: the record of
+	// who held what and when is the point of the whole mechanism.
+	ActivationKilled ActivationState = "killed"
+)
+
+// Activation is runtime state — never declarative, never in git (docs/13 F9).
+//
+// It is a grant window over one binding, not a grant of its own. Every renewal
+// re-validates both this record and the binding beneath it, so revoking either
+// ends the access at the next renewal without a sweep.
+type Activation struct {
+	ID      op.ID  `json:"id"`
+	Subject op.ID  `json:"subject"`
+	Binding op.ID  `json:"binding"`
+	Role    string `json:"role"`
+	Scope   string `json:"scope"`
+	Reason  string `json:"reason"`
+
+	State       ActivationState `json:"state"`
+	RequestedAt int64           `json:"requested_at"`
+	// Expiry is set when the activation becomes active, clamped to both the
+	// binding's MaxActivationSec and its NotAfter (JIT-on-JIT: no "eligible
+	// until Friday, activated Thursday 23:59 for four hours" leak).
+	Expiry     int64   `json:"expiry,omitempty"`
+	Approvals  []op.ID `json:"approvals,omitempty"`
+	DecidedBy  op.ID   `json:"decided_by,omitempty"`
+	DecidedAt  int64   `json:"decided_at,omitempty"`
+	KillReason string  `json:"kill_reason,omitempty"`
+}
+
+// Live reports whether this activation confers authority right now.
+func (a *Activation) Live(nowSec int64) bool {
+	return a.State == ActivationActive && a.Expiry > nowSec
 }
 
 // Session is the runtime half of the model: proof that a principal

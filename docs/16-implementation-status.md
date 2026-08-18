@@ -25,6 +25,7 @@ project has hit was found by running a real client, never by a test I wrote.
 | **Seal rotation** — file seal → HSM, or HSM key → successor | A live domain rotated with every credential still valid |
 | **Split CA ceremonies** — one offline root certifying many per-node issuers | Two nodes of different custody (file seal, PKCS#11) under one root; each leaf chains to it |
 | **Trust bundles** — root-signed anchors + issuer set + revocation + epochs | `openssl` verifying leaves against anchors a consumer fetched over HTTP and chose between |
+| **Privileged access (PAM)** — eligible-vs-held, approval, step-up, kill | A live node refusing an authority the principal is eligible for until someone else approves it |
 | **Anchored audit** — hash-chained log, signed checkpoints, peer witnessing with replay | A real rollback attack (keys intact) that the local chain calls valid and the witness refuses |
 | **Multi-domain fabric** — several domains federated, bundles held separately and never merged | A 4-domain fabric (org root over home + gcp, sovereign aws) refusing cross-domain impersonation from both a shared root and a separate one |
 
@@ -49,8 +50,11 @@ Not oversights — each is scheduled with the milestone that needs it (docs/15):
   would need a delegated online signing key, which does not exist.
 - **The agent.** Workstation and host modes (docs/08) do not exist. Kubernetes
   needs no agent, which is why the MVP could skip it.
-- **JIT/PAM activation.** The data model supports it (docs/13); the activation
-  API and approval flow do not exist.
+- **Hardware-bound step-up.** Activation checks which authentication methods a
+  session carries and how recent they are; a challenge-bound assertion from a
+  hardware authenticator (docs/13 semantic 4) awaits E-05 and the agent.
+- **Notification.** A pending approval sits in a queue until someone runs
+  `signet pam pending`. Nothing pages an approver.
 - **GitOps reconciler.** Genesis loads declarative config once; there is no
   continuous reconciliation, drift detection, or plan/apply.
 - **Audit anchoring outside Signet.** Checkpoints are witnessed by peer domains
@@ -145,3 +149,10 @@ Kept as a record of where the value came from:
     earlier state with every key intact, which is what an attacker with the box
     would actually do. That is the run that exercises replay divergence. The
     weaker test passed; it just was not testing the thing.
+14. **A PAM test asserted the wrong thing and passed anyway.** The
+    self-approval test checked that alice could not *write* after approving her
+    own request — but alice also held `domain-admin` at `/` in that fixture, so
+    she legitimately could. The refusal was working; the assertion was
+    measuring something else and would have gone on passing if self-approval
+    had silently started working. Now it asserts on the activation's own state
+    and approval list, which is the property under test.

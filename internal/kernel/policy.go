@@ -35,6 +35,7 @@ func HasAuthority(tx *store.Tx, subject op.ID, v Verb, path string, nowSec int64
 	if err != nil {
 		return false, err
 	}
+	var acts []Activation
 	for _, b := range bs {
 		if b.NotAfter != 0 && nowSec >= b.NotAfter {
 			continue // expired JIT grant: simply stops being honored
@@ -42,8 +43,30 @@ func HasAuthority(tx *store.Tx, subject op.ID, v Verb, path string, nowSec int64
 		if !ScopeCovers(b.Scope, path) {
 			continue
 		}
-		if roleGrants(b.Role, v) {
+		if !roleGrants(b.Role, v) {
+			continue
+		}
+		if !b.ActivationRequired {
 			return true, nil
+		}
+		// Eligible, not holding. The authority exists but is switched off until
+		// an activation says otherwise — and this is re-checked on every call,
+		// so an activation expiring or being killed ends the access at the next
+		// renewal without anything having to go and revoke it (docs/13).
+		if acts == nil {
+			var err error
+			if acts, err = LoadActivations(tx, subject); err != nil {
+				return false, err
+			}
+			if acts == nil {
+				acts = []Activation{} // loaded, genuinely empty
+			}
+		}
+		for i := range acts {
+			a := &acts[i]
+			if a.Binding == b.ID && a.Live(nowSec) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil

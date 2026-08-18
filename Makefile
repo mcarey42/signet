@@ -95,3 +95,11 @@ test-fabric: build
 test-audit: build
 	@cp $(BIN) ./signet-testbin
 	@BIN=$(PWD)/signet-testbin ./test/audit/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s
+
+# Privileged access: eligibility is not possession. Proven against a running
+# node -- alice cannot use an authority she is merely eligible for, cannot
+# approve her own request, and loses it when the window is killed.
+.PHONY: test-pam
+test-pam: build
+	@cp $(BIN) ./signet-testbin
+	@BIN=$(PWD)/signet-testbin ./test/pam/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s

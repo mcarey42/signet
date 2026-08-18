@@ -142,6 +142,14 @@ func (h *Handler) Routes() *http.ServeMux {
 	// their contents.
 	mux.HandleFunc("GET /v1/audit/witnessed", h.auditWitnessed)
 
+	// Privileged access management. Every route here is authenticated: what a
+	// principal is eligible for is itself sensitive, since it is a map of which
+	// authorities are worth stealing a session for.
+	mux.HandleFunc("GET /v1/pam/eligible", h.pamEligible)
+	mux.HandleFunc("POST /v1/pam/activate", h.pamActivate)
+	mux.HandleFunc("GET /v1/pam/pending", h.pamPending)
+	mux.HandleFunc("POST /v1/pam/decide", h.pamDecide)
+
 	mux.HandleFunc("/", h.notFound)
 	return mux
 }
@@ -282,6 +290,108 @@ func (h *Handler) auditWitness(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, envelope(map[string]any{
 		"domain": rec.Domain, "count": rec.Count, "head": rec.Head,
 	}))
+}
+
+func (h *Handler) pamEligible(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	el, err := h.k.Eligible(r.Context(), s.Principal)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"eligible": el}))
+}
+
+func (h *Handler) pamActivate(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	var body struct {
+		Binding    string `json:"binding"`
+		Reason     string `json:"reason"`
+		ForSeconds int64  `json:"for_seconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	// The session supplies the authentication facts step-up is judged against,
+	// so a caller cannot assert its own AMR or auth time.
+	id, err := h.k.RequestActivation(r.Context(), s, op.ID(body.Binding), body.Reason, body.ForSeconds)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	acts, err := h.k.Activations(r.Context(), s.Principal)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for _, a := range acts {
+		if a.ID == id {
+			writeJSON(w, http.StatusOK, envelope(map[string]any{
+				"id": a.ID, "state": a.State, "expiry": a.Expiry, "role": a.Role, "scope": a.Scope,
+			}))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"id": id}))
+}
+
+func (h *Handler) pamPending(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	all, err := h.k.PendingActivations(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Show only what this principal could actually decide. A queue full of
+	// requests you cannot act on is noise, and it leaks the shape of other
+	// people's privileges.
+	var mine []kernel.Activation
+	for _, a := range all {
+		if err := h.k.Authorize(r.Context(), s, kernel.VerbAdmin, a.Scope); err == nil {
+			mine = append(mine, a)
+		}
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"pending": mine}))
+}
+
+func (h *Handler) pamDecide(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	var body struct {
+		Subject string `json:"subject"`
+		ID      string `json:"id"`
+		Verb    string `json:"verb"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	// Authority to decide is re-checked inside Apply against the binding's own
+	// scope; this is the early refusal, not the enforcement.
+	err = h.k.DecideActivation(r.Context(), s.Principal, op.ID(body.Subject), op.ID(body.ID),
+		op.ActivationVerb(body.Verb), body.Reason)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"id": body.ID, "verb": body.Verb}))
 }
 
 func (h *Handler) auditWitnessed(w http.ResponseWriter, r *http.Request) {

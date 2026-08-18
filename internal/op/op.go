@@ -27,25 +27,27 @@ const FormatVersion uint16 = 1
 type Kind uint16
 
 const (
-	KindInvalid        Kind = 0
-	KindPutPrincipal   Kind = 1
-	KindPutBinding     Kind = 2
-	KindPutSecret      Kind = 3
-	KindCreateSession  Kind = 4
-	KindRevokeSession  Kind = 5
-	KindPutIssuer      Kind = 6
-	KindPutMapping     Kind = 7
-	KindVersionAction  Kind = 8
-	KindDestroySecret  Kind = 9
-	KindPutSecretMeta  Kind = 10
-	KindPutCA          Kind = 11
-	KindPutPKIRole     Kind = 12
-	KindRecordIssue    Kind = 13
-	KindPutRolePolicy  Kind = 14
-	KindPutKey         Kind = 15
-	KindPutSSHRole     Kind = 16
-	KindPutTrustBundle Kind = 17
-	KindPutWitness     Kind = 18
+	KindInvalid           Kind = 0
+	KindPutPrincipal      Kind = 1
+	KindPutBinding        Kind = 2
+	KindPutSecret         Kind = 3
+	KindCreateSession     Kind = 4
+	KindRevokeSession     Kind = 5
+	KindPutIssuer         Kind = 6
+	KindPutMapping        Kind = 7
+	KindVersionAction     Kind = 8
+	KindDestroySecret     Kind = 9
+	KindPutSecretMeta     Kind = 10
+	KindPutCA             Kind = 11
+	KindPutPKIRole        Kind = 12
+	KindRecordIssue       Kind = 13
+	KindPutRolePolicy     Kind = 14
+	KindPutKey            Kind = 15
+	KindPutSSHRole        Kind = 16
+	KindPutTrustBundle    Kind = 17
+	KindPutWitness        Kind = 18
+	KindRequestActivation Kind = 19
+	KindActivationAction  Kind = 20
 )
 
 func (k Kind) String() string {
@@ -86,6 +88,10 @@ func (k Kind) String() string {
 		return "PutTrustBundle"
 	case KindPutWitness:
 		return "PutWitness"
+	case KindRequestActivation:
+		return "RequestActivation"
+	case KindActivationAction:
+		return "ActivationAction"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -120,6 +126,13 @@ type PutBinding struct {
 	Scope    string `json:"scope"`
 	Grantor  ID     `json:"grantor"`
 	NotAfter int64  `json:"not_after,omitempty"` // 0 = no expiry; JIT grants set it
+	// PAM fields: eligibility rather than possession. See kernel.Binding.
+	ActivationRequired bool     `json:"activation_required,omitempty"`
+	MaxActivationSec   int64    `json:"max_activation_sec,omitempty"`
+	ApprovalRequired   bool     `json:"approval_required,omitempty"`
+	MinApprovers       int      `json:"min_approvers,omitempty"`
+	StepUpAMR          []string `json:"step_up_amr,omitempty"`
+	StepUpMaxAgeSec    int64    `json:"step_up_max_age_sec,omitempty"`
 }
 
 type PutSecret struct {
@@ -276,6 +289,43 @@ type PutWitness struct {
 	Grantor ID     `json:"grantor"`
 }
 
+// RequestActivation asks to hold an authority the requester is merely eligible
+// for. It creates the record; it does not confer anything.
+type RequestActivation struct {
+	Header
+	ID      ID     `json:"id"`
+	Subject ID     `json:"subject"`
+	Binding ID     `json:"binding"`
+	Reason  string `json:"reason"`
+	// ForSeconds is what the requester asked for. Apply clamps it — a request
+	// is a request, not an instruction.
+	ForSeconds int64 `json:"for_seconds"`
+	// SessionAuthTime and SessionAMR carry the requester's authentication facts
+	// at propose time, because Apply must be pure: it cannot go and look at a
+	// session, and a step-up decision made from stale facts is no decision.
+	SessionAuthTime int64    `json:"session_auth_time"`
+	SessionAMR      []string `json:"session_amr,omitempty"`
+}
+
+// ActivationVerb is what is being done to an activation.
+type ActivationVerb string
+
+const (
+	ActivationApprove ActivationVerb = "approve"
+	ActivationDeny    ActivationVerb = "deny"
+	ActivationKill    ActivationVerb = "kill"
+)
+
+// ActivationAction approves, denies, or kills an activation.
+type ActivationAction struct {
+	Header
+	Subject ID             `json:"subject"`
+	ID      ID             `json:"id"`
+	Verb    ActivationVerb `json:"verb"`
+	Actor2  ID             `json:"actor_id"` // the deciding principal
+	Reason  string         `json:"reason,omitempty"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -309,24 +359,26 @@ type PutMapping struct {
 	Grantor         ID       `json:"grantor"`
 }
 
-func (PutPrincipal) OpKind() Kind   { return KindPutPrincipal }
-func (PutBinding) OpKind() Kind     { return KindPutBinding }
-func (PutSecret) OpKind() Kind      { return KindPutSecret }
-func (CreateSession) OpKind() Kind  { return KindCreateSession }
-func (RevokeSession) OpKind() Kind  { return KindRevokeSession }
-func (PutIssuer) OpKind() Kind      { return KindPutIssuer }
-func (VersionAction) OpKind() Kind  { return KindVersionAction }
-func (DestroySecret) OpKind() Kind  { return KindDestroySecret }
-func (PutSecretMeta) OpKind() Kind  { return KindPutSecretMeta }
-func (PutMapping) OpKind() Kind     { return KindPutMapping }
-func (PutCA) OpKind() Kind          { return KindPutCA }
-func (PutPKIRole) OpKind() Kind     { return KindPutPKIRole }
-func (RecordIssuance) OpKind() Kind { return KindRecordIssue }
-func (PutRolePolicy) OpKind() Kind  { return KindPutRolePolicy }
-func (PutKey) OpKind() Kind         { return KindPutKey }
-func (PutSSHRole) OpKind() Kind     { return KindPutSSHRole }
-func (PutTrustBundle) OpKind() Kind { return KindPutTrustBundle }
-func (PutWitness) OpKind() Kind     { return KindPutWitness }
+func (PutPrincipal) OpKind() Kind      { return KindPutPrincipal }
+func (PutBinding) OpKind() Kind        { return KindPutBinding }
+func (PutSecret) OpKind() Kind         { return KindPutSecret }
+func (CreateSession) OpKind() Kind     { return KindCreateSession }
+func (RevokeSession) OpKind() Kind     { return KindRevokeSession }
+func (PutIssuer) OpKind() Kind         { return KindPutIssuer }
+func (VersionAction) OpKind() Kind     { return KindVersionAction }
+func (DestroySecret) OpKind() Kind     { return KindDestroySecret }
+func (PutSecretMeta) OpKind() Kind     { return KindPutSecretMeta }
+func (PutMapping) OpKind() Kind        { return KindPutMapping }
+func (PutCA) OpKind() Kind             { return KindPutCA }
+func (PutPKIRole) OpKind() Kind        { return KindPutPKIRole }
+func (RecordIssuance) OpKind() Kind    { return KindRecordIssue }
+func (PutRolePolicy) OpKind() Kind     { return KindPutRolePolicy }
+func (PutKey) OpKind() Kind            { return KindPutKey }
+func (PutSSHRole) OpKind() Kind        { return KindPutSSHRole }
+func (PutTrustBundle) OpKind() Kind    { return KindPutTrustBundle }
+func (PutWitness) OpKind() Kind        { return KindPutWitness }
+func (RequestActivation) OpKind() Kind { return KindRequestActivation }
+func (ActivationAction) OpKind() Kind  { return KindActivationAction }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -421,6 +473,12 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindPutWitness:
 		var v PutWitness
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindRequestActivation:
+		var v RequestActivation
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindActivationAction:
+		var v ActivationAction
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))
