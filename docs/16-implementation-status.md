@@ -25,6 +25,7 @@ project has hit was found by running a real client, never by a test I wrote.
 | **Seal rotation** — file seal → HSM, or HSM key → successor | A live domain rotated with every credential still valid |
 | **Split CA ceremonies** — one offline root certifying many per-node issuers | Two nodes of different custody (file seal, PKCS#11) under one root; each leaf chains to it |
 | **Trust bundles** — root-signed anchors + issuer set + revocation + epochs | `openssl` verifying leaves against anchors a consumer fetched over HTTP and chose between |
+| **Anchored audit** — hash-chained log, signed checkpoints, peer witnessing with replay | A real rollback attack (keys intact) that the local chain calls valid and the witness refuses |
 | **Multi-domain fabric** — several domains federated, bundles held separately and never merged | A 4-domain fabric (org root over home + gcp, sovereign aws) refusing cross-domain impersonation from both a shared root and a separate one |
 
 ## What is deliberately absent
@@ -52,8 +53,10 @@ Not oversights — each is scheduled with the milestone that needs it (docs/15):
   API and approval flow do not exist.
 - **GitOps reconciler.** Genesis loads declarative config once; there is no
   continuous reconciliation, drift detection, or plan/apply.
-- **Anchored audit.** Audit records are FSM state, hash-chaining and external
-  anchoring are not yet built.
+- **Audit anchoring outside Signet.** Checkpoints are witnessed by peer domains
+  (milestone 5a); shipping them to an object-lock bucket or transparency log,
+  for a domain with no peer, is not built. Nor is scheduling — witnessing runs
+  when invoked, not on a timer.
 - **Backups.** The format is designed (docs/03) but no backup ships yet.
 - **SAML, ACME, WebAuthn, TPM and cloud-KMS seals.**
 
@@ -135,3 +138,10 @@ Kept as a record of where the value came from:
    monthly bundle refresh would have been a monthly outage. Publishing is now
    an authorized API write, verified kernel-side against the root the node
    already chains to.
+13. **The first audit e2e tested the easy attack and I nearly kept it.** Wiping
+    a node and rebuilding it was caught — but by the *checkpoint key changing*,
+    not by the chain, so the rewrite-detection path never ran and a genuine
+    conflict was never recorded. Rewritten to roll the node back to a real
+    earlier state with every key intact, which is what an attacker with the box
+    would actually do. That is the run that exercises replay divergence. The
+    weaker test passed; it just was not testing the thing.

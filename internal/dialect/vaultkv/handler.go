@@ -11,7 +11,9 @@
 package vaultkv
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -20,8 +22,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mcarey42/signet/internal/audit"
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/store"
 	"github.com/mcarey42/signet/internal/trust"
 )
 
@@ -48,6 +52,9 @@ type Config struct {
 	// NodeID selects this node's own issuing authority when the domain has
 	// several. Falls back to the shared authority when it has none.
 	NodeID string
+	// Domain names this trust domain in the artifacts it signs — audit
+	// checkpoints, so a witness can tell whose history it is holding.
+	Domain string
 	Status func() Status
 }
 
@@ -122,6 +129,19 @@ func (h *Handler) Routes() *http.ServeMux {
 	mux.HandleFunc("PUT /v1/trust/bundle", h.putTrustBundle)
 	mux.HandleFunc("POST /v1/trust/bundle", h.putTrustBundle)
 
+	// A checkpoint and the key that signs it are public: they are claims about
+	// this node's history, meant to be held and checked by others. The entries
+	// behind them are not — an audit log names principals, paths, and what was
+	// touched — so fetching those needs authority.
+	mux.HandleFunc("GET /v1/audit/checkpoint", h.auditCheckpoint)
+	mux.HandleFunc("GET /v1/audit/pubkey", h.auditPubkey)
+	mux.HandleFunc("GET /v1/audit/entries", h.auditEntries)
+	mux.HandleFunc("POST /v1/audit/witness", h.auditWitness)
+	// What this node has witnessed is public: evidence nobody can read is not
+	// much use as evidence, and it names other domains' chain heads rather than
+	// their contents.
+	mux.HandleFunc("GET /v1/audit/witnessed", h.auditWitnessed)
+
 	mux.HandleFunc("/", h.notFound)
 	return mux
 }
@@ -164,6 +184,126 @@ func (h *Handler) putTrustBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, envelope(map[string]any{"domain": p.Domain, "epoch": p.Epoch}))
+}
+
+func (h *Handler) auditCheckpoint(w http.ResponseWriter, r *http.Request) {
+	c, err := h.k.Checkpoint(r.Context(), h.cfg.Domain, h.cfg.NodeID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, c)
+}
+
+func (h *Handler) auditPubkey(w http.ResponseWriter, r *http.Request) {
+	pub, kid, err := h.k.AuditPublicKey(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"kid": kid, "alg": "ES256",
+		"pem": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})),
+	})
+}
+
+func (h *Handler) auditEntries(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	// Audit entries name principals and the paths they touched, so reading them
+	// is a read at the root of the tree, not a public operation like the
+	// checkpoint that summarizes them.
+	if err := h.k.Authorize(r.Context(), s, kernel.VerbRead, "/"); err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied: reading audit entries needs read authority at /")
+		return
+	}
+	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	upTo, _ := strconv.ParseUint(r.URL.Query().Get("up_to"), 10, 64)
+	entries, err := h.k.AuditEntries(r.Context(), after, upTo)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
+// auditWitness accepts another domain's checkpoint. This node then holds
+// evidence that domain cannot retract.
+func (h *Handler) auditWitness(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	if err := h.k.Authorize(r.Context(), s, kernel.VerbWrite, "/"); err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied: witnessing needs write authority at /")
+		return
+	}
+	var body struct {
+		Checkpoint *audit.Signed      `json:"checkpoint"`
+		Entries    []store.AuditEntry `json:"entries"`
+		PubkeyPEM  string             `json:"pubkey"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 32<<20)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	if body.Checkpoint == nil || body.PubkeyPEM == "" {
+		writeErr(w, http.StatusBadRequest, "a witness request needs both 'checkpoint' and 'pubkey'")
+		return
+	}
+	pub, err := kernel.ParsePublicKeyPEM([]byte(body.PubkeyPEM))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rec, wErr := h.k.Witness(r.Context(), s.Principal, body.Checkpoint, body.Entries, pub)
+	if wErr != nil {
+		// A conflict is a successful detection, not a server fault: report it
+		// with the evidence, because that evidence is the entire point.
+		code := http.StatusBadRequest
+		body := map[string]any{"errors": []string{wErr.Error()}}
+		if rec != nil && rec.Conflict != nil {
+			code = http.StatusConflict
+			body["conflict"] = rec.Conflict
+			body["witnessed"] = map[string]any{"count": rec.Count, "head": rec.Head}
+		}
+		writeJSON(w, code, body)
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{
+		"domain": rec.Domain, "count": rec.Count, "head": rec.Head,
+	}))
+}
+
+func (h *Handler) auditWitnessed(w http.ResponseWriter, r *http.Request) {
+	if d := r.URL.Query().Get("domain"); d != "" {
+		rec, err := h.k.Witnessed(r.Context(), d)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if rec == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"domain": d, "count": 0})
+			return
+		}
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+	all, err := h.k.AllWitnessed(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"witnessed": all})
 }
 
 func (h *Handler) trustBundle(w http.ResponseWriter, r *http.Request) {

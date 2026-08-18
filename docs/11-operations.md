@@ -1,7 +1,7 @@
 # 11 — Operations
 
-**Status: Draft** (seal, key custody, and rotation implemented; backups and
-anchored audit still design-only)
+**Status: Draft** (seal, key custody, rotation, and anchored audit implemented;
+backups still design-only)
 
 ## Key custody & seal (Open — highest-stakes operational design)
 
@@ -77,6 +77,53 @@ wrapper hides them off-box.
   distinguish a legitimately-issued credential from a tampered-but-real one
   (the diamond-ticket lesson).
 - Prometheus metrics; health endpoints that distinguish "sealed" from "down".
+
+### Built: anchored audit (2026-08-17, milestone 5a)
+
+`internal/store` chains every audit entry to its predecessor; `internal/audit`
+adds signed checkpoints and peer witnessing. `signet audit verify | checkpoint |
+witness | witnessed`, proven end to end in `test/audit/run.sh`.
+
+**The chain and the anchor catch different things, and the split is the whole
+design.** Measured, in that order, against a real rewrite:
+
+| Attack | Hash chain | Witness |
+|---|---|---|
+| Edit a record in place | **caught** — breaks every link after it | caught |
+| Remove an entry from the middle | **caught** — sequence and links both fail | caught |
+| Truncate the newest entries | *misses* — what remains is a valid chain | **caught** |
+| Roll back and re-run differently | *misses* — internally perfect, same keys | **caught** |
+| Wipe the node and start over | *misses* — a fresh valid chain | **caught** (key changes) |
+
+The third and fourth rows are why this milestone is "anchored" rather than
+"hash-chained". A chain assumes the attacker cannot recompute it; whoever holds
+the node can. `test/audit/run.sh` asserts that the local chain reports the
+rewritten log as **intact** — because it is — immediately before the witness
+refuses it. Shipping the chain alone would have been a tamper-evidence claim
+that does not survive its own threat model.
+
+**Witnesses verify, they do not file.** A witness is handed the entries since
+the checkpoint it last saw and replays them onto the head it already holds. A
+filing-cabinet witness would catch only rewrites that contradict a checkpoint it
+happens to possess and miss everything between them; replay makes it an
+append-only enforcer, so whatever a witness has accepted is provably a prefix of
+what it accepts later.
+
+**Conflicts are stored, not just returned.** The value of a witness is that it
+holds evidence after the fact, so a detection that vanished with the error would
+be worth nothing. A witness in conflict refuses further checkpoints from that
+domain until the conflict is resolved deliberately — it cannot be reset by
+asking again.
+
+**The checkpoint key is pinned on first witness.** A node rebuilt from nothing
+loses its audit key, so it can no longer prove it is the same domain; that is
+recorded as evidence in its own right rather than treated as a rotation.
+
+Still open: shipping checkpoints to a non-Signet anchor (object-lock bucket,
+transparency log) for domains with no peer to witness them; and scheduling, so
+witnessing happens on a timer rather than when an operator remembers. A domain
+that witnesses nobody and is witnessed by nobody has a hash chain and nothing
+anchoring it — `signet audit witnessed` says so out loud.
 
 ## Decided: private keys are sealed before they are proposed (2026-08-16)
 

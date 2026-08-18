@@ -49,6 +49,7 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet seal rotate -data-dir DIR -to URI       move key custody to another seal
   signet ca ...                                  CA ceremonies (see: signet ca help)
   signet trust ...                               trust bundles (see: signet trust help)
+  signet audit ...                               tamper-evident history (see: signet audit help)
 `
 
 func main() {
@@ -70,6 +71,8 @@ func main() {
 		err = cmdSeal(os.Args[2:])
 	case "trust":
 		err = cmdTrust(os.Args[2:])
+	case "audit":
+		err = cmdAudit(os.Args[2:])
 	case "ca":
 		err = cmdCA(os.Args[2:])
 	case "-h", "--help", "help":
@@ -242,7 +245,7 @@ func cmdGenesis(args []string) error {
 	// Signing keys for the offline dialects. Separate per purpose so one stolen
 	// key is not all of them, and generated here so a domain can mint
 	// credentials the moment it exists.
-	for _, purpose := range []keys.Purpose{keys.PurposeToken, keys.PurposeSSH} {
+	for _, purpose := range []keys.Purpose{keys.PurposeToken, keys.PurposeSSH, keys.PurposeAudit} {
 		if _, err := k.ActiveKey(ctx, purpose); err == nil {
 			continue // already present; rotation is a separate, deliberate act
 		}
@@ -580,6 +583,7 @@ func cmdServe(args []string) error {
 	mount := fs.String("mount", "secrets", "KV mount name clients address")
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
 	nodeID := fs.String("node-id", "", "which issuing authority is this node's own, when the domain has several (see `signet ca issuers`); not the consensus identity")
+	domain := fs.String("domain", "", "this trust domain's name, e.g. home.example.net (named in audit checkpoints)")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
 	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
@@ -604,6 +608,7 @@ func cmdServe(args []string) error {
 		PKIMount:   *pkiMount,
 		CAName:     "default",
 		NodeID:     *nodeID,
+		Domain:     *domain,
 		Status: func() vaultkv.Status {
 			s := node.Status()
 			return vaultkv.Status{Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader}

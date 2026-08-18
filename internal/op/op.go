@@ -45,6 +45,7 @@ const (
 	KindPutKey         Kind = 15
 	KindPutSSHRole     Kind = 16
 	KindPutTrustBundle Kind = 17
+	KindPutWitness     Kind = 18
 )
 
 func (k Kind) String() string {
@@ -83,6 +84,8 @@ func (k Kind) String() string {
 		return "PutSSHRole"
 	case KindPutTrustBundle:
 		return "PutTrustBundle"
+	case KindPutWitness:
+		return "PutWitness"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -263,6 +266,16 @@ type PutTrustBundle struct {
 	Grantor ID     `json:"grantor"`
 }
 
+// PutWitness records what this node has witnessed of another domain's audit
+// chain. It is ordinary durable state: a witness that forgot on restart would
+// be no witness at all.
+type PutWitness struct {
+	Header
+	Domain  string `json:"domain"`
+	Record  []byte `json:"record"`
+	Grantor ID     `json:"grantor"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -313,6 +326,7 @@ func (PutRolePolicy) OpKind() Kind  { return KindPutRolePolicy }
 func (PutKey) OpKind() Kind         { return KindPutKey }
 func (PutSSHRole) OpKind() Kind     { return KindPutSSHRole }
 func (PutTrustBundle) OpKind() Kind { return KindPutTrustBundle }
+func (PutWitness) OpKind() Kind     { return KindPutWitness }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -404,6 +418,9 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindPutTrustBundle:
 		var v PutTrustBundle
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutWitness:
+		var v PutWitness
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

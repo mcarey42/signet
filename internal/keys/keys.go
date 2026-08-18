@@ -37,6 +37,11 @@ const (
 	PurposeToken Purpose = "token"
 	// PurposeSSH is the SSH certificate authority key.
 	PurposeSSH Purpose = "ssh"
+	// PurposeAudit signs audit checkpoints. It is separate from the token key
+	// because the two make different claims to different audiences: a token key
+	// says who someone is, this one says what this node's history was. Sharing
+	// one key would let a compromise of either purpose forge the other.
+	PurposeAudit Purpose = "audit"
 )
 
 // Key is one signing key. Old keys stay published for verification after
@@ -157,6 +162,26 @@ func GenerateAlg(purpose Purpose, alg string, nowSec int64) (*Key, error) {
 		return &Key{ID: id, Purpose: purpose, Algorithm: "ES256",
 			PrivatePEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
 			CreatedSec: nowSec}, nil
+	case PurposeAudit:
+		// ES256: checkpoints are small, frequent, and verified by peers, so a
+		// compact signature matters more than the wide compatibility that makes
+		// RS256 the right default for tokens.
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(k)
+		if err != nil {
+			return nil, err
+		}
+		id, err := thumbprint(k.Public())
+		if err != nil {
+			return nil, err
+		}
+		return &Key{ID: id, Purpose: purpose, Algorithm: "ES256",
+			PrivatePEM: pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}),
+			CreatedSec: nowSec}, nil
+
 	case PurposeSSH:
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {

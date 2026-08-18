@@ -31,6 +31,7 @@ const (
 	BucketKeys       = "keys"        // "<purpose>/<kid>" -> signing key
 	BucketSSHRoles   = "ssh_roles"   // name -> ssh signing role
 	BucketTrust      = "trust"       // domain -> root-signed trust bundle
+	BucketWitness    = "witness"     // domain -> what we have witnessed of its audit chain
 	BucketMeta       = "meta"
 )
 
@@ -38,7 +39,7 @@ var allBuckets = []string{
 	BucketPrincipals, BucketPathIndex, BucketBindings, BucketSecretMeta, BucketSecretData,
 	BucketSessions, BucketIssuers, BucketMappings,
 	BucketCA, BucketPKIRoles, BucketIssuance,
-	BucketRolePolicy, BucketKeys, BucketSSHRoles, BucketTrust, BucketAudit, BucketMeta,
+	BucketRolePolicy, BucketKeys, BucketSSHRoles, BucketTrust, BucketWitness, BucketAudit, BucketMeta,
 }
 
 var ErrReadOnly = errors.New("store: write attempted in a read-only transaction")
@@ -149,19 +150,6 @@ func (t *Tx) ScanPrefix(bucket, prefix string, fn func(key string, val []byte) b
 		}
 	}
 	return nil
-}
-
-// AppendAudit records one event as part of the same transaction as the change
-// it describes. Audit is FSM state, not a side effect: keying by log position
-// makes it idempotent under replay and restore, and atomic with the mutation —
-// a mutation without its audit record is impossible, not merely unlikely
-// (docs/15 contract 3).
-func (t *Tx) AppendAudit(rec []byte) error {
-	if !t.write {
-		return ErrReadOnly
-	}
-	key := fmt.Sprintf("%020d:%020d:%010d", t.term, t.index, t.seq)
-	return t.Put(BucketAudit, key, rec)
 }
 
 // Position reports the log entry this transaction is applying.

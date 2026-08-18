@@ -63,6 +63,8 @@ func Apply(tx *store.Tx, o op.Op) op.Result {
 		return applyPutSSHRole(tx, v)
 	case *op.PutTrustBundle:
 		return applyPutTrustBundle(tx, v)
+	case *op.PutWitness:
+		return applyPutWitness(tx, v)
 	default:
 		return op.Result{Err: fmt.Errorf("kernel: no applier for %T", o)}
 	}
@@ -330,6 +332,8 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutTrustBundle:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("%s epoch %d", v.Domain, v.Epoch)
+	case *op.PutWitness:
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, "witness "+v.Domain
 	case *op.PutCA:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, v.Name
 	case *op.PutPKIRole:

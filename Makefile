@@ -87,3 +87,11 @@ test-trust: build
 test-fabric: build
 	@cp $(BIN) ./signet-testbin
 	@BIN=$(PWD)/signet-testbin ./test/fabric/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s
+
+# Anchored audit: a hash-chained log, checkpoints witnessed by a peer domain,
+# and the two shapes a real rewrite takes (rollback with keys intact, and a
+# wipe) demonstrated against both layers.
+.PHONY: test-audit
+test-audit: build
+	@cp $(BIN) ./signet-testbin
+	@BIN=$(PWD)/signet-testbin ./test/audit/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s
