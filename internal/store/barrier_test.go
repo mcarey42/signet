@@ -3,7 +3,9 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
+	"os"
 	"path/filepath"
+	"strings"
 
 	bolt "go.etcd.io/bbolt"
 	"testing"
@@ -226,4 +228,97 @@ func openStoreWithKey(t *testing.T, seed byte) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// A bbolt file shorter than its own header says must be refused, not handed to
+// bbolt.
+//
+// bbolt trusts the page count in its meta page and memory-maps accordingly, so
+// a file shorter than that faults on the first freelist read: SIGSEGV, fatal
+// error, no recover() possible and no deferred handler. Every command against
+// the directory died the same way, INCLUDING the diagnostics an operator would
+// reach for.
+//
+// The check is deliberately NARROW. bbolt over-allocates, so a file can be
+// meaningfully shorter than its full length and still open cleanly — and
+// refusing a file bbolt would have handled is a false positive that stops a
+// healthy node, which is worse than the crash it would prevent. So this asserts
+// the boundary precisely: one byte below the header's own requirement is
+// refused, exactly at it is accepted.
+func TestBoltFileShorterThanItsHeaderIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 5)
+	}
+	s, err := Open(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 20; i++ {
+		if err := s.Update(1, uint64(i), func(tx *Tx) error {
+			return tx.Put(BucketSecretData, "k", make([]byte, 4096))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+
+	if err := CheckBoltFile(path); err != nil {
+		t.Fatalf("a healthy file was rejected — a false positive here stops a good node: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	needed := boltRequiredSize(t, raw)
+	if needed <= 0 || needed > int64(len(raw)) {
+		t.Fatalf("could not derive the required size (%d of %d)", needed, len(raw))
+	}
+
+	atBoundary := filepath.Join(dir, "at.db")
+	if err := os.WriteFile(atBoundary, raw[:needed], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckBoltFile(atBoundary); err != nil {
+		t.Errorf("a file exactly as long as its header requires was refused: %v", err)
+	}
+
+	below := filepath.Join(dir, "below.db")
+	if err := os.WriteFile(below, raw[:needed-1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckBoltFile(below); err == nil {
+		t.Error("a file one byte shorter than its header requires was accepted; opening it would fault")
+	}
+}
+
+// boltRequiredSize reads the meta page the same way CheckBoltFile does, so the
+// test pins the boundary rather than restating the arithmetic.
+func boltRequiredSize(t *testing.T, raw []byte) int64 {
+	t.Helper()
+	m := raw[boltPageHeader:]
+	if binary.LittleEndian.Uint32(m[0:4]) != boltMagic {
+		t.Fatal("test fixture is not a bbolt file")
+	}
+	pageSize := int64(binary.LittleEndian.Uint32(m[8:12]))
+	return int64(binary.LittleEndian.Uint64(m[40:48])) * pageSize
+}
+
+// A file that is not a bbolt database at all is refused with a different, and
+// more useful, message than "truncated".
+func TestNonBoltFileIsRefused(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "not-a-db")
+	if err := os.WriteFile(p, []byte("this is a text file, not a database at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := CheckBoltFile(p)
+	if err == nil {
+		t.Fatal("a non-database file was accepted")
+	}
+	if !strings.Contains(err.Error(), "does not look like a bbolt database") {
+		t.Fatalf("expected a not-a-database message, got: %v", err)
+	}
 }

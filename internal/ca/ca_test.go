@@ -312,3 +312,40 @@ func TestURIPrefixMatchesAtABoundary(t *testing.T) {
 		}
 	}
 }
+
+// A sealed CA key belongs to ONE authority and must not open under another.
+//
+// caKeyAAD was a constant identical for every CA in a domain, which is the same
+// as no binding at all: a sealed issuing key could be lifted from one CA's
+// record and dropped onto another's and it would decrypt. Anyone able to write
+// a CA record — or an operator mixing up a restore — could make one authority
+// sign with another's key while every certificate still verified.
+func TestSealedCAKeyIsBoundToItsAuthority(t *testing.T) {
+	sl := fileSeal(t)
+	gen, err := Genesis("Example", []string{"a.example.net"}, nil, 24*time.Hour, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := gen.Material.SealAs(sl, "issuer/node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sealed.SealedKey == nil {
+		t.Fatal("nothing was sealed")
+	}
+
+	// Under its own authority it opens.
+	if _, err := Load(sealed.LoadedAs("issuer/node-a"), sl); err != nil {
+		t.Fatalf("the CA should load under its own name: %v", err)
+	}
+
+	// Moved onto another authority's record, it must not.
+	if _, err := Load(sealed.LoadedAs("issuer/node-b"), sl); err == nil {
+		t.Fatal("a sealed issuing key opened under a different authority — the AAD binds nothing")
+	}
+
+	// Sealing without naming the authority is refused rather than defaulted.
+	if _, err := gen.Material.SealAs(sl, ""); err == nil {
+		t.Fatal("an issuing key was sealed with no authority to bind it to")
+	}
+}

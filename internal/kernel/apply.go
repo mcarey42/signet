@@ -404,6 +404,37 @@ func applyPutMapping(tx *store.Tx, o *op.PutMapping) op.Result {
 		return op.Result{Err: fmt.Errorf("mapping: grantor %s lacks admin authority over %s", o.Grantor, target.Path)}
 	}
 
+	// Where a principal LIVES is not what it can DO.
+	//
+	// Checking only the target's path was the same path-versus-ID seam as
+	// PE-03: bindings attach to the stable ID and their scopes are unrelated to
+	// where the principal sits in the tree, so a subtree admin could map onto a
+	// principal that happens to live in their subtree while holding authority
+	// far outside it — and thereby mint sessions with that authority.
+	//
+	// A mapping hands out the target's whole authority, so the grantor must be
+	// able to confer all of it.
+	targetBindings, err := LoadBindings(tx, o.Principal)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	for _, b := range targetBindings {
+		if b.NotAfter != 0 && o.AtSec >= b.NotAfter {
+			continue // already lapsed; confers nothing to hand out
+		}
+		ok, err := HasAuthority(tx, o.Grantor, VerbAdmin, b.Scope, o.AtSec)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if !ok {
+			return op.Result{Err: fmt.Errorf(
+				"mapping: %s holds %s at %s, which %s cannot confer. A mapping hands out everything "+
+					"the target can do, so it may only be authored by someone who could have "+
+					"granted all of it — where a principal lives is not what it can do",
+				o.Principal, b.Role, b.Scope, o.Grantor)}
+		}
+	}
+
 	m := Mapping{
 		ID: o.ID, Name: o.Name, Issuer: o.Issuer,
 		Namespaces: o.Namespaces, ServiceAccounts: o.ServiceAccounts,

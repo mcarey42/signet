@@ -72,7 +72,12 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	logs, err := raftboltdb.NewBoltStore(filepath.Join(cfg.DataDir, "raft.db"))
+	raftPath := filepath.Join(cfg.DataDir, "raft.db")
+	if err := store.CheckBoltFile(raftPath); err != nil {
+		st.Close()
+		return nil, err
+	}
+	logs, err := raftboltdb.NewBoltStore(raftPath)
 	if err != nil {
 		st.Close()
 		return nil, fmt.Errorf("fsm: open raft log: %w", err)

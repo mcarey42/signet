@@ -44,6 +44,10 @@ import (
 // are immutable — the old key would remain readable forever to anyone who ever
 // obtained the barrier key (docs/11).
 type Material struct {
+	// Name is the authority this material belongs to, e.g. "issuer/node-a".
+	// It is part of the AAD binding the sealed key, so moving material between
+	// authorities makes it undecryptable rather than merely mislabelled.
+	Name                string         `json:"name,omitempty"`
 	RootCertPEM         []byte         `json:"root_cert"`
 	IntermediateCertPEM []byte         `json:"intermediate_cert"`
 	IntermediateKeyPEM  []byte         `json:"intermediate_key,omitempty"` // in-memory only
@@ -57,13 +61,46 @@ type Material struct {
 	// ceremony, not certificates — but recording it means a future ceremony can
 	// find the key instead of hunting for a file.
 	RootRef *seal.KeyRef `json:"root_ref,omitempty"`
+
+	// sealedAs is the authority this record was READ from, for material written
+	// before Name existed. Not serialized: the store key is the truth.
+	sealedAs string
 }
 
-const caKeyAAD = "signet/ca/intermediate/v1"
+// LoadedAs records the authority a stored record was read from, so material
+// written before Name existed can still be opened under its binding.
+func (m Material) LoadedAs(name string) Material { m.sealedAs = name; return m }
+
+// caKeyAAD binds a sealed CA key to the AUTHORITY it belongs to.
+//
+// It used to be the bare constant below, identical for every CA in a domain.
+// AAD binds a ciphertext to its context, and with a shared context there was no
+// binding at all: a sealed issuing key could be lifted from one CA's record and
+// dropped onto another's, and it would decrypt. An attacker who could write a
+// CA record — or an operator who mixed up a restore — could make one authority
+// sign with another's key while every certificate still verified.
+//
+// internal/keys had this right all along (keyAAD includes the key's ID); the CA
+// path simply did not, and the inconsistency is what made it easy to miss.
+func caKeyAAD(name string) []byte {
+	return []byte(caKeyAADv2 + name)
+}
+
+const (
+	caKeyAADv2 = "signet/ca/intermediate/v2/"
+	// caKeyAADv1 is the unbound context used before CA keys were tied to their
+	// authority. Material sealed under it still opens — the envelope is not
+	// re-sealed on read — but anything written since is bound, and rewrapping
+	// (seal rotation) upgrades it.
+	caKeyAADv1 = "signet/ca/intermediate/v1"
+)
 
 // Seal encloses the intermediate key and drops the plaintext, returning the
 // form that may be persisted.
-func (m Material) Seal(s seal.Seal) (Material, error) {
+func (m Material) Seal(s seal.Seal) (Material, error) { return m.SealAs(s, m.Name) }
+
+// SealAs encloses the intermediate key, bound to the authority it belongs to.
+func (m Material) SealAs(s seal.Seal, name string) (Material, error) {
 	// A key held in hardware has nothing to seal: there is no material.
 	if m.IntermediateRef != nil {
 		return m, nil
@@ -74,12 +111,18 @@ func (m Material) Seal(s seal.Seal) (Material, error) {
 	if len(m.IntermediateKeyPEM) == 0 {
 		return m, errors.New("ca: no intermediate key to seal")
 	}
-	env, err := seal.NewEnvelope(s, m.IntermediateKeyPEM, []byte(caKeyAAD))
+	if name == "" {
+		return m, errors.New(
+			"ca: refusing to seal an issuing key without naming its authority — the name is what " +
+				"binds the sealed key to this CA rather than to any CA")
+	}
+	env, err := seal.NewEnvelope(s, m.IntermediateKeyPEM, caKeyAAD(name))
 	if err != nil {
 		return m, err
 	}
 	m.SealedKey = env
 	m.IntermediateKeyPEM = nil
+	m.Name = name
 	return m, nil
 }
 
@@ -97,8 +140,34 @@ func (m Material) intermediateKey(s seal.Seal) ([]byte, error) {
 	if s == nil {
 		return nil, errors.New("ca: intermediate key is sealed and no seal was provided")
 	}
-	return m.SealedKey.Open(s, []byte(caKeyAAD))
+	// WHERE the record was found outranks what it says about itself. A record
+	// carries its own Name, but an attacker moving material between authorities
+	// moves that field along with it — so trusting it would make the binding
+	// self-attesting and therefore no binding at all. The store key is the
+	// authority; m.Name is only a fallback for material not yet stored.
+	name := m.sealedAs
+	if name == "" {
+		name = m.Name
+	}
+	if name != "" {
+		if pt, err := m.SealedKey.Open(s, caKeyAAD(name)); err == nil {
+			return pt, nil
+		}
+	}
+	// Fall back to the unbound v1 context so domains sealed before CA keys were
+	// tied to their authority keep opening. Nothing NEW is written this way, and
+	// a seal rotation rewrites it bound.
+	pt, err := m.SealedKey.Open(s, []byte(caKeyAAD1()))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"ca: this sealed issuing key does not open for authority %q. It was sealed for a "+
+				"different one, which now matters: a CA key is bound to the authority it belongs "+
+				"to and cannot be moved between them: %w", name, err)
+	}
+	return pt, nil
 }
+
+func caKeyAAD1() string { return caKeyAADv1 }
 
 // CA is a loaded, ready-to-sign authority.
 type CA struct {
@@ -662,12 +731,23 @@ func (m Material) Rewrap(from, to seal.Seal) (Material, error) {
 	if err != nil {
 		return m, err
 	}
-	env, err := seal.NewEnvelope(to, material, []byte(caKeyAAD))
+	// Rewrapping is also the upgrade path: material sealed under the old
+	// unbound context is written back bound to its authority.
+	name := m.sealedAs
+	if name == "" {
+		name = m.Name
+	}
+	if name == "" {
+		return m, errors.New(
+			"ca: cannot rewrap an issuing key without knowing which authority it belongs to")
+	}
+	env, err := seal.NewEnvelope(to, material, caKeyAAD(name))
 	if err != nil {
 		return m, err
 	}
 	m.SealedKey = env
 	m.IntermediateKeyPEM = nil
+	m.Name = name
 	return m, nil
 }
 

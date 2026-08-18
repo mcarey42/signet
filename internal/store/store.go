@@ -58,6 +58,11 @@ type Store struct {
 // persistence and key custody are separate concerns, and keeping them apart is
 // what let a hardware seal drop in without touching this file.
 func Open(path string, rootKey []byte) (*Store, error) {
+	// Refuse a truncated file rather than faulting inside bbolt's mmap, which
+	// kills the process outright and cannot be recovered from.
+	if err := CheckBoltFile(path); err != nil {
+		return nil, err
+	}
 	b, err := NewBarrier(rootKey)
 	if err != nil {
 		return nil, err

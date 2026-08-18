@@ -1,7 +1,9 @@
 package store
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -48,6 +50,12 @@ func (s *Store) SnapshotRaw() (map[string]map[string][]byte, error) {
 // Recovery is exactly when a system must be at its most careful, since whoever
 // is running it has already had one bad day.
 func (s *Store) RestoreRaw(data map[string]map[string][]byte) error {
+	if unknown := UnknownBuckets(data); len(unknown) > 0 {
+		return fmt.Errorf(
+			"store: refusing to restore a snapshot containing buckets this build does not know: %v. "+
+				"They would be silently dropped and the node would come up looking healthy with "+
+				"state missing. This snapshot is probably from a newer Signet", unknown)
+	}
 	if err := s.validateSnapshot(data); err != nil {
 		return err
 	}
@@ -80,6 +88,27 @@ func (s *Store) RestoreRaw(data map[string]map[string][]byte) error {
 // construction. An empty snapshot is accepted — there is nothing to be wrong
 // about, and refusing would block the legitimate restore of a fresh domain.
 func (s *Store) validateSnapshot(data map[string]map[string][]byte) error {
+	// An EMPTY snapshot must not be able to wipe a populated store.
+	//
+	// The decryption check below cannot catch this: an empty snapshot has no
+	// values to disagree about, so it passed and the wipe proceeded. `null`
+	// decodes to a nil map and erased every bucket. A snapshot legitimately
+	// covering an empty domain exists only before that domain has ever been
+	// written, which the seal high-water mark records.
+	if snapshotIsEmpty(data) {
+		_, everWritten, err := s.SealHighWaterMark()
+		if err != nil {
+			return err
+		}
+		if everWritten {
+			return errors.New(
+				"store: refusing to restore an empty snapshot over a store that has been written " +
+					"to. An empty snapshot describes a domain with no history; this one has some, " +
+					"and restoring would erase it")
+		}
+		return nil
+	}
+
 	var tried int
 	// Prefer the applied-index watermark: every non-empty store has one, and it
 	// is small and cheap to open.
@@ -117,4 +146,34 @@ func (s *Store) validateSnapshot(data map[string]map[string][]byte) error {
 			"domain's barrier (tried %d). It belongs to a different domain, or to this one before "+
 			"its root key changed. Restoring would destroy the state already here and replace it "+
 			"with state this node cannot read", tried)
+}
+
+func snapshotIsEmpty(data map[string]map[string][]byte) bool {
+	for _, b := range data {
+		if len(b) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// UnknownBuckets reports buckets in a snapshot this build does not know about.
+//
+// RestoreRaw only copies buckets it knows, so an unknown one was silently
+// dropped — which means restoring a snapshot from a NEWER Signet would quietly
+// discard whatever that version added, and the node would come up looking fine
+// with state missing. Better to refuse and say which.
+func UnknownBuckets(data map[string]map[string][]byte) []string {
+	known := make(map[string]bool, len(allBuckets))
+	for _, b := range allBuckets {
+		known[b] = true
+	}
+	var out []string
+	for name, contents := range data {
+		if !known[name] && len(contents) > 0 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

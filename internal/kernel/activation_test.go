@@ -896,3 +896,67 @@ func mustPutPrincipal(t *testing.T, tx *store.Tx, id, path string, grantor op.ID
 		t.Fatal(res.Err)
 	}
 }
+
+// A mapping hands out everything the target can do, so the grantor must be
+// able to confer all of it — not merely control where the target lives.
+//
+// PE-05, the same path-versus-ID seam as PE-03: bindings attach to the stable
+// ID and their scopes are unrelated to the principal's place in the tree, so a
+// subtree admin could map onto a principal that happens to live in their
+// subtree while holding authority far outside it.
+func TestMappingChecksWhatTheTargetCanDoNotWhereItLives(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		mustPutPrincipal(t, tx, "root", "/people/root", "")
+		bindPAM(t, tx, Binding{ID: "b-root", Subject: "root", Role: "domain-admin", Scope: "/"})
+		// An issuer must exist, or every mapping below is refused for THAT
+		// reason and the assertions would pass without testing anything.
+		if res := applyPutIssuer(tx, &op.PutIssuer{
+			Header: op.Header{Actor: "root", AtSec: 1000}, ID: "iss1", Name: "kind",
+			Verifier: "k8s-sa", URL: "https://k8s.example", Audience: "signet",
+			JWKS:    []byte(`{"keys":[{"kty":"RSA","kid":"k","n":"AQAB","e":"AQAB"}]}`),
+			Grantor: "root",
+		}); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		// alice administers one subtree.
+		bindPAM(t, tx, Binding{ID: "b-alice", Subject: alice, Role: "domain-admin",
+			Scope: "/clusters/lab"})
+		// A principal that LIVES in alice's subtree but holds authority outside it.
+		mustPutPrincipal(t, tx, "runner", "/clusters/lab/apps/runner", "root")
+		bindPAM(t, tx, Binding{ID: "b-runner", Subject: "runner", Role: "kv-admin",
+			Scope: "/secrets/production"})
+
+		res := applyPutMapping(tx, &op.PutMapping{
+			Header: op.Header{Actor: alice, AtSec: 1000}, ID: "m1", Name: "ci",
+			Issuer: "kind", Namespaces: []string{"ci"}, ServiceAccounts: []string{"runner"},
+			Principal: "runner", Grantor: alice,
+		})
+		if res.Err == nil {
+			t.Fatal("a subtree admin mapped onto a principal holding authority outside that subtree")
+		}
+		if !strings.Contains(res.Err.Error(), "cannot confer") {
+			t.Fatalf("unhelpful refusal: %v", res.Err)
+		}
+
+		// A target whose authority is inside alice's subtree is fine.
+		mustPutPrincipal(t, tx, "inside", "/clusters/lab/apps/inside", "root")
+		bindPAM(t, tx, Binding{ID: "b-inside", Subject: "inside", Role: "kv-reader",
+			Scope: "/clusters/lab/secrets"})
+		if res := applyPutMapping(tx, &op.PutMapping{
+			Header: op.Header{Actor: alice, AtSec: 1000}, ID: "m2", Name: "ci2",
+			Issuer: "kind", Namespaces: []string{"ci"}, ServiceAccounts: []string{"inside"},
+			Principal: "inside", Grantor: alice,
+		}); res.Err != nil {
+			t.Fatalf("a target wholly inside the grantor's scope should be mappable: %v", res.Err)
+		}
+
+		// And root, who can confer anything, may map the first one.
+		if res := applyPutMapping(tx, &op.PutMapping{
+			Header: op.Header{Actor: "root", AtSec: 1000}, ID: "m3", Name: "ci3",
+			Issuer: "kind", Namespaces: []string{"ci"}, ServiceAccounts: []string{"runner"},
+			Principal: "runner", Grantor: "root",
+		}); res.Err != nil {
+			t.Fatalf("a domain admin should be able to map anything: %v", res.Err)
+		}
+	})
+}

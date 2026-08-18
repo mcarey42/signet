@@ -120,7 +120,7 @@ type IssuanceRecord struct {
 func (k *Kernel) InstallCA(ctx context.Context, grantor op.ID, name string, m ca.Material) error {
 	// Seal at propose time, so the plaintext key never enters the log at all —
 	// not even in an entry that is later compacted away.
-	sealed, err := m.Seal(k.seal)
+	sealed, err := m.SealAs(k.seal, name)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,10 @@ func loadCA(tx *store.Tx, name string, sl seal.Seal) (*ca.CA, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
-	return ca.Load(m, sl)
+	// The record's key in the store IS the authority's name, which is what the
+	// sealed key is bound to — and it is authoritative over anything the record
+	// claims about itself.
+	return ca.Load(m.LoadedAs(name), sl)
 }
 
 // IssuanceLog returns recorded issuances, newest serials last. It is an
