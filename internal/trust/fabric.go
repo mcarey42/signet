@@ -176,8 +176,15 @@ func (p *Payload) VerifyCert(cert *x509.Certificate, extra []*x509.Certificate, 
 		revoked[r] = true
 	}
 	for _, iss := range p.Issuers {
-		if !revoked[iss.SPKI] {
-			published[iss.SPKI] = true
+		// Computed, never declared. A published entry that misreports its own
+		// fingerprint must not be able to dodge revocation or smuggle itself
+		// into the trusted set under someone else's name.
+		c, err := parseCert(iss.CertPEM)
+		if err != nil {
+			continue
+		}
+		if fp := Fingerprint(c); !revoked[fp] {
+			published[fp] = true
 		}
 	}
 
@@ -191,7 +198,7 @@ func (p *Payload) VerifyCert(cert *x509.Certificate, extra []*x509.Certificate, 
 			if a.Role != role {
 				continue
 			}
-			if revoked[a.SPKI] {
+			if ac, err := parseCert(a.CertPEM); err == nil && revoked[Fingerprint(ac)] {
 				continue
 			}
 			roots, inter, err := p.Pool(a)
@@ -244,7 +251,11 @@ func chainUsesPublishedIssuers(chains [][]*x509.Certificate, anchor *Anchor, pub
 		// Skip the leaf (index 0) and the anchor itself (last).
 		for _, c := range chain[1 : len(chain)-1] {
 			fp := Fingerprint(c)
-			if published[fp] || fp == anchor.SPKI {
+			anchorFP := ""
+			if ac, err := parseCert(anchor.CertPEM); err == nil {
+				anchorFP = Fingerprint(ac)
+			}
+			if published[fp] || fp == anchorFP {
 				continue
 			}
 			ok = false

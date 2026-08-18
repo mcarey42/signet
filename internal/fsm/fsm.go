@@ -25,12 +25,31 @@ type FSM struct {
 	applied atomic.Uint64
 }
 
-func New(st *store.Store) *FSM {
-	f := &FSM{st: st}
-	if i, err := st.AppliedIndex(); err == nil {
-		f.applied.Store(i)
+// New reads the applied-index watermark and FAILS CLOSED if it cannot.
+//
+// This used to swallow the error, and the consequence was not merely a replay
+// bug. The barrier derives its AES-GCM nonce from the log position
+// (term, index, seq), so the watermark is silently the guarantee that a given
+// nonce is used once. Lose it — one flipped bit in the stored value is enough,
+// no key required — and Raft replays the whole log, re-deriving every nonce
+// against different plaintext. Nonce reuse in GCM leaks the XOR of the
+// plaintexts and the authentication key with it, which turns a corrupted byte
+// into plaintext recovery and forgery.
+//
+// A node that cannot read its own watermark therefore must not start. Refusing
+// to serve is a bad morning; serving with a reused keystream is unrecoverable.
+func New(st *store.Store) (*FSM, error) {
+	i, err := st.AppliedIndex()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"refusing to start: this node cannot read its applied-index watermark (%w). That "+
+				"watermark is what keeps the barrier's nonces unique, so starting without it would "+
+				"replay the log and encrypt different data under nonces already used. Restore this "+
+				"data directory from a backup rather than starting it", err)
 	}
-	return f
+	f := &FSM{st: st}
+	f.applied.Store(i)
+	return f, nil
 }
 
 // Apply executes one committed log entry. Everything nondeterministic already

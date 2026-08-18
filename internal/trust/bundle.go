@@ -237,33 +237,48 @@ func Verify(b *Bundle, opts VerifyOptions) (*Payload, error) {
 	}
 
 	// 1. Was it signed by the key we pinned?
-	var signed bool
-	for _, sig := range b.Signatures {
-		if sig.SPKI != opts.PinnedSPKI {
+	//
+	// The pin is matched against a fingerprint COMPUTED from the certificate,
+	// never against the SPKI string the bundle carries. Those strings are
+	// claims the bundle makes about itself, and this check once believed them:
+	// it found the anchor whose declared SPKI equalled the pin and then
+	// verified using whatever key that certificate happened to hold. Since the
+	// pin is public by design — every consumer is given it — an attacker could
+	// mint a bundle under their own root, label it with the victim's
+	// fingerprint, and be accepted. Pinning was decorative.
+	//
+	// Compute, then compare. A self-reported identity is not an identity.
+	var signed, foundPinnedAnchor bool
+	digest := sha256.Sum256(raw)
+	for i := range p.Anchors {
+		cert, err := parseCert(p.Anchors[i].CertPEM)
+		if err != nil {
 			continue
 		}
-		anchor := findAnchorBySPKI(&p, sig.SPKI)
-		if anchor == nil {
-			return nil, fmt.Errorf(
-				"trust: the bundle is signed by the pinned key %s but does not contain that key as "+
-					"an anchor, so its own signer would not be trusted by anyone reading it", sig.SPKI)
+		if Fingerprint(cert) != opts.PinnedSPKI {
+			continue
 		}
-		cert, err := parseCert(anchor.CertPEM)
-		if err != nil {
-			return nil, fmt.Errorf("trust: the signing anchor's certificate is unreadable: %w", err)
-		}
+		foundPinnedAnchor = true
 		pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
 		if !ok {
-			return nil, fmt.Errorf("trust: the signing anchor holds a %T key; bundles are ECDSA-signed", cert.PublicKey)
+			return nil, fmt.Errorf(
+				"trust: the pinned anchor holds a %T key; bundles are ECDSA-signed", cert.PublicKey)
 		}
-		digest := sha256.Sum256(raw)
-		if !ecdsa.VerifyASN1(pub, digest[:], sig.Sig) {
-			return nil, errors.New(
-				"trust: the bundle's signature does not verify under the pinned key. The bundle was " +
-					"altered in transit, or was produced by something that does not hold that key")
+		for _, sig := range b.Signatures {
+			if ecdsa.VerifyASN1(pub, digest[:], sig.Sig) {
+				signed = true
+				break
+			}
 		}
-		signed = true
 		break
+	}
+	// The two failures are diagnostically different and worth separating: one
+	// says the bundle came from the wrong place, the other that it was changed
+	// on the way from the right one.
+	if foundPinnedAnchor && !signed {
+		return nil, errors.New(
+			"trust: the bundle carries the pinned anchor, but no signature on it verifies under " +
+				"that key. The bundle was altered after it was signed")
 	}
 	if !signed {
 		return nil, fmt.Errorf(
@@ -354,12 +369,15 @@ func (p *Payload) Pool(anchor *Anchor) (roots *x509.CertPool, intermediates *x50
 	}
 	intermediates = x509.NewCertPool()
 	for _, iss := range p.Issuers {
-		if revoked[iss.SPKI] {
-			continue // withdrawn: do not help build a path through it
-		}
 		c, err := parseCert(iss.CertPEM)
 		if err != nil {
 			continue
+		}
+		// Keyed on the COMPUTED fingerprint, not the declared one: otherwise a
+		// withdrawn issuer could be resurrected simply by misreporting its own
+		// SPKI in the published entry.
+		if revoked[Fingerprint(c)] {
+			continue // withdrawn: do not help build a path through it
 		}
 		intermediates.AddCert(c)
 	}
@@ -391,15 +409,6 @@ func PayloadOfBytes(raw []byte) (*Payload, error) {
 		return nil, fmt.Errorf("trust: this does not parse as a trust bundle: %w", err)
 	}
 	return PayloadOf(&b)
-}
-
-func findAnchorBySPKI(p *Payload, spki string) *Anchor {
-	for i := range p.Anchors {
-		if p.Anchors[i].SPKI == spki {
-			return &p.Anchors[i]
-		}
-	}
-	return nil
 }
 
 func parseCert(p []byte) (*x509.Certificate, error) {

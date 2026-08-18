@@ -98,7 +98,11 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
-	r, err := raft.NewRaft(rcfg, New(st), logs, logs, snaps, trans)
+	machine, err := New(st)
+	if err != nil {
+		return nil, err
+	}
+	r, err := raft.NewRaft(rcfg, machine, logs, logs, snaps, trans)
 	if err != nil {
 		logs.Close()
 		st.Close()

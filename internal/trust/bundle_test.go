@@ -180,7 +180,7 @@ func TestTamperedPayloadIsRefused(t *testing.T) {
 	bundle.Payload = base64.StdEncoding.EncodeToString(raw)
 
 	_, err = Verify(bundle, VerifyOptions{PinnedSPKI: Fingerprint(root.cert), Now: time.Now()})
-	wantErr(t, err, "signature does not verify")
+	wantErr(t, err, "altered after it was signed")
 }
 
 // An old bundle stays a valid signed artifact forever. Replaying one is the
@@ -297,8 +297,11 @@ func TestBundleNotContainingItsOwnSignerIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The pinned key is not among the anchors, so no anchor's COMPUTED
+	// fingerprint matches it and the bundle is refused. (This used to be
+	// reported via the declared-SPKI lookup; that lookup was the pin bypass.)
 	_, err = Verify(b, VerifyOptions{PinnedSPKI: Fingerprint(root.cert), Now: time.Now()})
-	wantErr(t, err, "does not contain that key as an anchor")
+	wantErr(t, err, "not signed by the pinned key")
 }
 
 // A bundle with no anchors, or no expiry, is refused at build time: both would
@@ -414,5 +417,83 @@ func TestSkewDoesNotExtendAStaleBundle(t *testing.T) {
 	_, err = Verify(b, VerifyOptions{PinnedSPKI: pin, Now: time.Now().Add(-30 * time.Second), Skew: 5 * time.Minute})
 	if err != nil {
 		t.Fatalf("a clock 30s slow should still accept a fresh bundle: %v", err)
+	}
+}
+
+// The pin must be checked against the key that ACTUALLY signed, not against a
+// label the bundle applies to itself.
+//
+// This was a complete bypass of trust pinning. Verify compared the consumer's
+// pinned fingerprint to Anchor.SPKI and Signature.SPKI — both strings the
+// bundle declares — and then verified with whatever key the attached
+// certificate carried. Fingerprint() existed and was never called here. So an
+// attacker who knew only the PUBLIC pin (which is published on purpose: it is
+// handed out to every consumer) could mint a bundle under their own root,
+// label it with the victim's fingerprint, and have every consumer install it.
+//
+// It reached the authority node too, through PutTrustBundle.
+func TestPinIsCheckedAgainstTheActualSigningKey(t *testing.T) {
+	victim := mkCA(t, "Example Root CA", nil)
+	victimIssuer := mkCA(t, "issuer a", victim)
+	pin := Fingerprint(victim.cert) // public by design — consumers are given it
+
+	// The attacker's own root, with no relationship to the victim's.
+	attacker := mkCA(t, "Example Root CA", nil)
+	attackerIssuer := mkCA(t, "issuer a", attacker)
+
+	// Build a bundle under the attacker's key, then LABEL its anchor and its
+	// signature with the victim's fingerprint. Every declared field says the
+	// right thing; only the actual key is wrong.
+	p, err := Build("home.example.net", 1, time.Hour,
+		[]Anchor{{Role: RoleRoot, Name: "Example Root CA",
+			CertPEM: attacker.pem, SPKI: pin}}, // <- the lie
+		[]Issuer{issuerOf(attackerIssuer)}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := Sign(p, attacker.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged.Signatures[0].SPKI = pin // <- the same lie, on the signature
+
+	_, err = Verify(forged, VerifyOptions{PinnedSPKI: pin, Domain: "home.example.net", Now: time.Now()})
+	if err == nil {
+		t.Fatal("a bundle signed by an unrelated key was accepted because it CLAIMED the pinned fingerprint")
+	}
+	if !strings.Contains(err.Error(), "does not match") && !strings.Contains(err.Error(), "not signed by the pinned key") {
+		t.Fatalf("refused, but not for the right reason: %v", err)
+	}
+
+	// The genuine article still verifies, so the fix is not merely "refuse".
+	good := mkBundle(t, victim, 1, time.Hour, victimIssuer)
+	if _, err := Verify(good, VerifyOptions{PinnedSPKI: pin, Domain: "home.example.net", Now: time.Now()}); err != nil {
+		t.Fatalf("the real bundle must still verify: %v", err)
+	}
+}
+
+// A withdrawn issuer must not be resurrected by relabelling it, either.
+func TestRevocationIsKeyedOnTheActualKey(t *testing.T) {
+	root := mkCA(t, "example root", nil)
+	bad := mkCA(t, "issuer compromised", root)
+	leaf := mkCA(t, "leaf", bad)
+
+	anchors := []Anchor{anchorOf(root, RoleRoot)}
+	// The published issuer entry lies about its own fingerprint, so a naive
+	// revocation check keyed on the declared label would miss it.
+	lying := Issuer{Name: "issuer compromised", CertPEM: bad.pem, SPKI: "sha256:not-my-real-fingerprint"}
+	p, err := Build("home.example.net", 2, time.Hour, anchors, []Issuer{lying}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Revoked = []string{Fingerprint(bad.cert)} // revoked by its REAL fingerprint
+	b, err := Sign(p, root.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mustVerify(t, b, VerifyOptions{PinnedSPKI: Fingerprint(root.cert), Now: time.Now()})
+
+	if _, err := got.VerifyCert(leaf.cert, nil, time.Now()); err == nil {
+		t.Fatal("a revoked issuer was usable because its published entry misreported its fingerprint")
 	}
 }

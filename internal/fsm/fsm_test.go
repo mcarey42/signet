@@ -9,6 +9,7 @@ import (
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/seal"
+	"github.com/mcarey42/signet/internal/store"
 )
 
 // openNode brings up a domain over a fixed directory, so a test can close it
@@ -133,5 +134,51 @@ func TestScopeSurvivesRestart(t *testing.T) {
 	}
 	if _, err := k.GetSecret(ctx, esoSess, "/secrets/other/thing", 0); err == nil {
 		t.Error("out-of-scope read succeeded after restart")
+	}
+}
+
+// A node that cannot read its applied-index watermark must refuse to start.
+//
+// The watermark is silently the barrier's nonce-uniqueness guarantee: nonces
+// are derived from the log position, so replaying the log re-uses every nonce
+// against different plaintext. AES-GCM nonce reuse leaks the XOR of the
+// plaintexts and the authentication key with it. Swallowing this error turned
+// one corrupted byte into plaintext recovery and forgery, so it now fails
+// closed — refusing to serve is recoverable, a reused keystream is not.
+func TestFSMRefusesToStartWithoutItsWatermark(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	path := filepath.Join(dir, "state.db")
+
+	s, err := store.Open(path, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(1, 5, func(tx *store.Tx) error { return tx.SetAppliedIndex(5) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fsm.New(s); err != nil {
+		t.Fatalf("a healthy store should start: %v", err)
+	}
+	s.Close()
+
+	// Reopen under a DIFFERENT root key: the stored watermark no longer
+	// decrypts, which is the same observable condition as a corrupted byte.
+	other := make([]byte, 32)
+	for i := range other {
+		other[i] = byte(i + 99)
+	}
+	s2, err := store.Open(path, other)
+	if err != nil {
+		// Failing here is also acceptable — and better. Either way the node
+		// does not come up able to replay.
+		return
+	}
+	defer s2.Close()
+	if _, err := fsm.New(s2); err == nil {
+		t.Fatal("the FSM started despite being unable to read its watermark; it would replay the log and reuse nonces")
 	}
 }
