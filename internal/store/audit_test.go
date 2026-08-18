@@ -27,16 +27,25 @@ func openTestStore(t *testing.T) *Store {
 }
 
 // appendN writes n audit records, each in its own transaction, as the FSM does.
-func appendN(t *testing.T, s *Store, n int) {
+//
+// Log indexes advance monotonically and never repeat — the store now enforces
+// that, because a repeated index means a repeated nonce. from lets a test
+// continue a log rather than restarting one, which is what a real node does.
+func appendN(t *testing.T, s *Store, n int) { appendFrom(t, s, 1, n) }
+
+func appendFrom(t *testing.T, s *Store, from, n int) int {
 	t.Helper()
-	for i := 1; i <= n; i++ {
-		rec, _ := json.Marshal(map[string]any{"kind": "PutSecret", "subject": "/secrets/app", "seq": i})
-		if err := s.Update(1, uint64(i), func(tx *Tx) error {
+	idx := from
+	for i := 0; i < n; i++ {
+		rec, _ := json.Marshal(map[string]any{"kind": "PutSecret", "subject": "/secrets/app", "seq": idx})
+		if err := s.Update(1, uint64(idx), func(tx *Tx) error {
 			return tx.AppendAudit(rec)
 		}); err != nil {
 			t.Fatal(err)
 		}
+		idx++
 	}
+	return idx
 }
 
 func verify(t *testing.T, s *Store) (uint64, string, error) {
@@ -238,7 +247,7 @@ func TestChainDoesNotHealAfterTampering(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	appendN(t, s, 2) // keep writing as if nothing happened
+	appendFrom(t, s, 99, 2) // keep writing as if nothing happened
 
 	if _, _, err := verify(t, s); err == nil {
 		t.Fatal("later entries repaired a broken chain")

@@ -4,7 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -42,6 +41,15 @@ func NewBarrier(rootKey []byte) (*Barrier, error) {
 	return &Barrier{aead: aead, key: key}, nil
 }
 
+// Nonce layout. Both modes share one key, so they are domain-separated by
+// their first byte: a random nonce can never collide with a derived one, rather
+// than merely being unlikely to.
+const (
+	nonceDerived = 0x00 // byte 0 of a position-derived nonce
+	nonceRandom  = 0x01 // byte 0 of a propose-time random nonce
+	maxSeq       = 1<<24 - 1
+)
+
 // SealRandom encrypts with a random nonce. It is for propose-time use only
 // (Op payloads), where nondeterminism is allowed and expected.
 func (b *Barrier) SealRandom(plaintext, aad []byte) ([]byte, error) {
@@ -49,16 +57,35 @@ func (b *Barrier) SealRandom(plaintext, aad []byte) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
+	nonce[0] = nonceRandom
 	return b.seal(nonce, plaintext, aad), nil
 }
 
 // SealDeterministic encrypts with a nonce derived from the log position of the
 // entry being applied. Apply must be a pure function of (op, prior state), so
-// it cannot draw randomness; deriving from (term, index, seq) keeps Apply
-// deterministic while guaranteeing nonce uniqueness, since committed entries
-// never change position and seq is unique within one entry's transaction.
-func (b *Barrier) SealDeterministic(term, index uint64, seq uint32, plaintext, aad []byte) []byte {
-	return b.seal(b.deriveNonce(term, index, seq), plaintext, aad)
+// it cannot draw randomness; deriving from the position keeps Apply
+// deterministic while giving nonce uniqueness, since committed entries never
+// change position and seq is unique within one entry's transaction.
+//
+// The derivation is a BIJECTION, not a hash. It was a truncated HMAC, which
+// meant uniqueness of the nonce rested on the collision resistance of a 96-bit
+// truncation — an argument, where an argument was not needed. index and seq fit
+// exactly, so distinct positions now give distinct nonces by construction and
+// there is nothing left to reason about.
+//
+// term is deliberately absent: a committed Raft entry's index identifies it
+// uniquely, and an entry is only applied once committed, so term adds nothing
+// to uniqueness.
+//
+// Returns an error rather than wrapping when seq exhausts its field. Silently
+// wrapping would reuse a nonce inside a single transaction, which is precisely
+// the failure this function exists to make impossible.
+func (b *Barrier) SealDeterministic(index uint64, seq uint32, plaintext, aad []byte) ([]byte, error) {
+	nonce, err := b.deriveNonce(index, seq)
+	if err != nil {
+		return nil, err
+	}
+	return b.seal(nonce, plaintext, aad), nil
 }
 
 func (b *Barrier) seal(nonce, plaintext, aad []byte) []byte {
@@ -81,15 +108,30 @@ func (b *Barrier) Open(ct, aad []byte) ([]byte, error) {
 	return pt, nil
 }
 
-func (b *Barrier) deriveNonce(term, index uint64, seq uint32) []byte {
-	var msg [20]byte
-	binary.BigEndian.PutUint64(msg[0:8], term)
-	binary.BigEndian.PutUint64(msg[8:16], index)
-	binary.BigEndian.PutUint32(msg[16:20], seq)
-	mac := hmac.New(sha256.New, b.key)
-	mac.Write([]byte("signet/nonce/v1"))
-	mac.Write(msg[:])
-	return mac.Sum(nil)[:b.aead.NonceSize()]
+// deriveNonce maps (index, seq) injectively onto the 12-byte nonce:
+//
+//	byte 0     domain tag (0x00 = derived)
+//	bytes 1-8  index, big endian
+//	bytes 9-11 seq, big endian (24 bits)
+//
+// A previous format derived the nonce by HMAC and is still readable, because
+// the nonce travels with the ciphertext — only new writes use this layout.
+func (b *Barrier) deriveNonce(index uint64, seq uint32) ([]byte, error) {
+	if seq > maxSeq {
+		return nil, fmt.Errorf(
+			"barrier: %d writes in one log entry exceeds the %d this nonce layout can distinguish; "+
+				"refusing rather than reusing a nonce", seq, maxSeq)
+	}
+	if index>>56 != 0 {
+		return nil, fmt.Errorf("barrier: log index %d does not fit the nonce layout", index)
+	}
+	nonce := make([]byte, b.aead.NonceSize())
+	nonce[0] = nonceDerived
+	binary.BigEndian.PutUint64(nonce[1:9], index)
+	nonce[9] = byte(seq >> 16)
+	nonce[10] = byte(seq >> 8)
+	nonce[11] = byte(seq)
+	return nonce, nil
 }
 
 // aad binds a ciphertext to its location so a value cannot be moved between

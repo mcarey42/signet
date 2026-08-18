@@ -92,8 +92,63 @@ func (s *Store) Update(term, index uint64, fn func(*Tx) error) error {
 	// write contention shows up first.
 	defer metrics.Time(metrics.StoreWriteDuration)()
 	return s.db.Update(func(btx *bolt.Tx) error {
-		return fn(&Tx{tx: btx, b: s.b, term: term, index: index, write: true})
+		// The seal high-water mark: the highest log index ever used to derive a
+		// nonce in this store.
+		//
+		// Nonce uniqueness used to depend entirely on the applied-index
+		// watermark, which lives ENCRYPTED in the meta bucket — so anything that
+		// made it unreadable, or simply deleted it, silently reset it to zero
+		// and let the whole log replay, re-deriving every nonce against
+		// different plaintext. That is catastrophic for GCM, and it was
+		// reachable by deleting one key.
+		//
+		// This mark is stored in PLAINTEXT and outside that value's fate,
+		// precisely so it survives the loss of the thing it is guarding. It is
+		// not secret — it is a counter — and making it unreadable is exactly
+		// what an attacker would want.
+		hwm, hasHWM, err := readSealHWM(btx)
+		if err != nil {
+			return err
+		}
+		if hasHWM && index <= hwm {
+			return fmt.Errorf(
+				"store: refusing to write at log index %d: index %d has already been sealed in this "+
+					"store. Nonces are derived from the log position, so writing here again would "+
+					"encrypt new data under a nonce already used — which would expose the data "+
+					"already stored under it. This means the log is being replayed over durable "+
+					"state; restore from a backup rather than continuing", index, hwm)
+		}
+		if err := fn(&Tx{tx: btx, b: s.b, term: term, index: index, write: true}); err != nil {
+			return err
+		}
+		return writeSealHWM(btx, index)
 	})
+}
+
+// metaSealHWM is stored unencrypted, on purpose. See Update.
+const metaSealHWM = "seal_high_water_mark"
+
+func readSealHWM(btx *bolt.Tx) (uint64, bool, error) {
+	b := btx.Bucket([]byte(BucketMeta))
+	if b == nil {
+		return 0, false, nil
+	}
+	raw := b.Get([]byte(metaSealHWM))
+	if raw == nil {
+		return 0, false, nil
+	}
+	if len(raw) != 8 {
+		return 0, false, fmt.Errorf(
+			"store: the seal high-water mark is %d bytes, not 8. It guards nonce uniqueness, so a "+
+				"damaged one is not something to work around", len(raw))
+	}
+	return binary.BigEndian.Uint64(raw), true, nil
+}
+
+func writeSealHWM(btx *bolt.Tx, index uint64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], index)
+	return btx.Bucket([]byte(BucketMeta)).Put([]byte(metaSealHWM), buf[:])
 }
 
 // View runs fn in a read transaction — a consistent snapshot, no writer
@@ -120,7 +175,10 @@ func (t *Tx) Put(bucket, key string, val []byte) error {
 	if !t.write {
 		return ErrReadOnly
 	}
-	ct := t.b.SealDeterministic(t.term, t.index, t.seq, val, aad(bucket, key))
+	ct, err := t.b.SealDeterministic(t.index, t.seq, val, aad(bucket, key))
+	if err != nil {
+		return err
+	}
 	t.seq++
 	return t.tx.Bucket([]byte(bucket)).Put([]byte(key), ct)
 }
