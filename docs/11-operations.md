@@ -78,6 +78,31 @@ wrapper hides them off-box.
   (the diamond-ticket lesson).
 - Prometheus metrics; health endpoints that distinguish "sealed" from "down".
 
+### Rotation leaves a decision, not a claim (2026-08-18)
+
+`seal rotate` used to finish by announcing that "the old seal is no longer
+needed". That was true of *running* the domain and false of *opening* it:
+`root.seal.prev` holds the root key wrapped by the retired seal, and for a file
+seal the old key file sits beside it. A copy of the data directory therefore
+still opened with no device present, which makes a file→HSM migration cosmetic
+— precisely the migration whose whole point is that it should not be.
+
+The two files are also the only way back if the destination seal is lost. That
+is a real recovery path, so deleting them automatically would be its own bad
+surprise. The tool now:
+
+- names exactly what still opens the domain, and says the custody change is
+  **not complete** while it does;
+- reports the same thing from `seal status`, since residue outlives the
+  ceremony that made it — otherwise a rotation done months ago looks finished
+  forever;
+- offers `signet seal finalize` to remove it, refusing without `-yes` and
+  stating that finalizing also renders unreadable any backup taken before the
+  rotation.
+
+The operator decides. The tool's job is to make sure they know they are
+deciding.
+
 ### Built: anchored audit (2026-08-17, milestone 5a)
 
 `internal/store` chains every audit entry to its predecessor; `internal/audit`

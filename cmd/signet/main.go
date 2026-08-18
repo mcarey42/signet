@@ -736,7 +736,7 @@ func cmdToken(args []string) error {
 
 func cmdSeal(args []string) error {
 	if len(args) < 1 {
-		return errors.New("seal: expected status or rotate")
+		return errors.New("seal: expected status, rotate, or finalize")
 	}
 	fs := flag.NewFlagSet("seal", flag.ExitOnError)
 	dataDir := fs.String("data-dir", "", "data directory")
@@ -760,6 +760,8 @@ func cmdSeal(args []string) error {
 			return errors.New("seal rotate: -to is required")
 		}
 		return sealRotate(*dataDir, sealURI(*dataDir, *sealKey), sealURI(*dataDir, *to), *actorPath, *yes)
+	case "finalize":
+		return sealFinalize(*dataDir, sealURI(*dataDir, *sealKey), *yes)
 	}
 	return fmt.Errorf("seal: unknown subcommand %q", sub)
 }
@@ -798,6 +800,24 @@ func sealStatus(dataDir, sealCfg string) error {
 	if len(mixed) > 1 {
 		fmt.Println("\nWARNING: material is split across seals — a rotation did not finish.")
 		fmt.Println("Re-run `signet seal rotate` with the same destination; it resumes.")
+	}
+
+	// Residue outlives the ceremony that created it, so it belongs in status
+	// rather than only in the rotation's own output — otherwise a rotation done
+	// months ago looks complete forever.
+	if sl, err := seal.Open(sealCfg); err == nil {
+		defer sl.Close()
+		if residue, err := seal.FindResidue(dataDir, sl); err == nil && residue != nil {
+			if residue.OpensDomain() {
+				fmt.Printf("\nWARNING: this data directory still opens under a RETIRED seal.\n")
+			} else {
+				fmt.Printf("\nNote: predecessor material remains from an earlier rotation.\n")
+			}
+			for _, p := range residue.Paths {
+				fmt.Printf("  %s\n", p)
+			}
+			fmt.Println("Keep these somewhere this directory is not, or run `signet seal finalize`.")
+		}
 	}
 	return nil
 }
@@ -880,9 +900,75 @@ func sealRotate(dataDir, fromCfg, toCfg, actorPath string, yes bool) error {
 	}
 
 	fmt.Printf("\nrotation complete and verified under %s/%s\n", to.Name(), to.KeyID())
-	fmt.Println("The old seal is no longer needed to run this domain.")
-	fmt.Println("Destroying it also shreds any backup taken before now: those hold")
-	fmt.Println("material wrapped by the old seal and nothing else can open them.")
+
+	// Say what still opens this domain. The old message claimed the previous
+	// seal was "no longer needed", which was true of RUNNING the domain and
+	// false of OPENING it: root.seal.prev plus the old key file are both left
+	// behind, so a copy of this directory still opens with no device present.
+	residue, rerr := seal.FindResidue(dataDir, to)
+	if rerr != nil {
+		return fmt.Errorf("seal rotate: checking for predecessor material: %w", rerr)
+	}
+	if residue == nil {
+		fmt.Println("No predecessor material remains in the data directory.")
+		return nil
+	}
+
+	if residue.OpensDomain() {
+		fmt.Printf("\n%s\n", warnBanner)
+		fmt.Println("This rotation is NOT yet finalized. The data directory still contains")
+		fmt.Println("everything needed to open the domain under the RETIRED seal:")
+	} else {
+		fmt.Println("\nPredecessor material remains, though not enough on its own to open")
+		fmt.Println("the domain:")
+	}
+	for _, p := range residue.Paths {
+		fmt.Printf("  %s\n", p)
+	}
+	fmt.Printf("\n  %s\n", residue.Reason)
+	fmt.Println("\nThose files are also the only way back if the destination seal is lost,")
+	fmt.Println("which is why they are not removed for you. Keep them somewhere this")
+	fmt.Println("directory is not, or finalize:")
+	fmt.Printf("\n  signet seal finalize -data-dir %s\n", dataDir)
+	fmt.Println("\nFinalizing is irreversible, and it also renders unreadable any backup")
+	fmt.Println("taken before this rotation: those hold material wrapped by the old seal.")
+	return nil
+}
+
+const warnBanner = "!! the custody change is not complete !!"
+
+// sealFinalize removes the predecessor material a rotation left behind.
+func sealFinalize(dataDir, sealCfg string, yes bool) error {
+	active, err := seal.Open(sealCfg)
+	if err != nil {
+		return fmt.Errorf("seal finalize: opening the current seal: %w", err)
+	}
+	defer active.Close()
+
+	residue, err := seal.FindResidue(dataDir, active)
+	if err != nil {
+		return err
+	}
+	if residue == nil {
+		fmt.Println("nothing to finalize: no predecessor material in this data directory")
+		return nil
+	}
+	fmt.Println("This will permanently remove:")
+	for _, p := range residue.Paths {
+		fmt.Printf("  %s\n", p)
+	}
+	fmt.Println("\nAfter this the domain opens ONLY under its current seal, and any backup")
+	fmt.Println("taken before the rotation becomes unreadable — it holds material wrapped")
+	fmt.Println("by the seal you are about to destroy the key for.")
+	if !yes {
+		return errors.New(
+			"seal finalize: re-run with -yes once you have confirmed the current seal is " +
+				"backed up and any older backups are no longer needed")
+	}
+	if err := residue.Remove(); err != nil {
+		return err
+	}
+	fmt.Println("\nfinalized: predecessor material removed")
 	return nil
 }
 

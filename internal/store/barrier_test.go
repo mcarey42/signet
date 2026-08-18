@@ -133,3 +133,97 @@ func testBarrier(t *testing.T) *Barrier {
 	}
 	return b
 }
+
+// A snapshot from another domain must be refused BEFORE anything is destroyed.
+//
+// RestoreRaw wiped every bucket and then wrote the incoming values, so a
+// foreign snapshot — one sealed under a different barrier — left the node with
+// neither its old state nor readable new state. Bricked, permanently, by a
+// recovery attempt. Recovery is when a system must be at its most careful:
+// whoever is running it has already had one bad day.
+func TestForeignSnapshotIsRefusedBeforeDestroyingAnything(t *testing.T) {
+	mine := openStoreWithKey(t, 11)
+	theirs := openStoreWithKey(t, 99)
+
+	// Both domains hold a secret at the same path.
+	if err := mine.Update(1, 1, func(tx *Tx) error {
+		return tx.Put(BucketSecretData, "app", []byte("mine-original"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := theirs.Update(1, 1, func(tx *Tx) error {
+		return tx.Put(BucketSecretData, "app", []byte("theirs"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := theirs.SnapshotRaw()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mine.RestoreRaw(foreign); err == nil {
+		t.Fatal("a snapshot from another domain was restored")
+	}
+
+	// And the original state is untouched, which is the property that matters.
+	if err := mine.View(func(tx *Tx) error {
+		got, ok, err := tx.Get(BucketSecretData, "app")
+		if err != nil {
+			return err
+		}
+		if !ok || string(got) != "mine-original" {
+			t.Fatalf("the store was damaged by a refused restore: ok=%v got=%q", ok, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A snapshot from THIS domain still restores, or the check would be useless.
+func TestOwnSnapshotStillRestores(t *testing.T) {
+	s := openStoreWithKey(t, 11)
+	if err := s.Update(1, 1, func(tx *Tx) error {
+		return tx.Put(BucketSecretData, "app", []byte("v1"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.SnapshotRaw()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Update(1, 2, func(tx *Tx) error {
+		return tx.Put(BucketSecretData, "app", []byte("v2"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RestoreRaw(snap); err != nil {
+		t.Fatalf("a snapshot of this domain must restore: %v", err)
+	}
+	if err := s.View(func(tx *Tx) error {
+		got, _, err := tx.Get(BucketSecretData, "app")
+		if err != nil {
+			return err
+		}
+		if string(got) != "v1" {
+			t.Fatalf("restore did not take effect: %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func openStoreWithKey(t *testing.T, seed byte) *Store {
+	t.Helper()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = seed + byte(i)
+	}
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}

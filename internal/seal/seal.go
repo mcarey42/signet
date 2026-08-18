@@ -371,6 +371,85 @@ func RewrapRootKey(from, to Seal, dir string) error {
 	return os.Rename(tmp, path)
 }
 
+// Residue is material left in a data directory that would still open the domain
+// under a RETIRED seal.
+//
+// After rotating from a file seal to a token, root.seal.prev holds the root key
+// wrapped by the old seal, and the old key file usually sits beside it. Anyone
+// with a copy of the directory therefore has both halves, and the custody
+// change is cosmetic: the domain still opens with no device present. The
+// rotation used to announce that "the old seal is no longer needed", which was
+// true of running the domain and false of opening it.
+//
+// This is deliberately not deleted automatically. Those same two files are the
+// only way back if the destination seal is lost — a real recovery path, and
+// destroying it silently would be its own bad surprise. The operator decides;
+// the tool's job is to make sure they know they are deciding.
+type Residue struct {
+	Paths  []string // files that, together, still open the domain
+	Reason string
+}
+
+// FindResidue reports predecessor material in dir. active is the seal the
+// domain now runs under.
+func FindResidue(dir string, active Seal) (*Residue, error) {
+	prev := filepath.Join(dir, "root.seal.prev")
+	if _, err := os.Stat(prev); err != nil {
+		return nil, nil // nothing kept from a previous ceremony
+	}
+	raw, err := os.ReadFile(prev)
+	if err != nil {
+		return nil, err
+	}
+	var b Blob
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, err
+	}
+	// A predecessor wrapped by the seal we now run under is not residue; it is
+	// a redundant copy of the same custody.
+	if b.Seal == active.Name() && b.KeyID == active.KeyID() {
+		return nil, nil
+	}
+	r := &Residue{Paths: []string{prev}}
+	r.Reason = fmt.Sprintf(
+		"root.seal.prev holds this domain's root key wrapped by %s/%s, which is not the seal it "+
+			"now runs under (%s/%s)", b.Seal, b.KeyID, active.Name(), active.KeyID())
+	// A file seal sitting in the same directory completes the pair.
+	if b.Seal == "file" {
+		for _, name := range []string{"seal.key", filepath.Base(b.KeyID)} {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err == nil && !contains(r.Paths, p) {
+				r.Paths = append(r.Paths, p)
+			}
+		}
+	}
+	return r, nil
+}
+
+// OpensDomain reports whether the residue is self-sufficient: both the wrapped
+// root key AND a seal able to unwrap it are present here.
+func (r *Residue) OpensDomain() bool { return r != nil && len(r.Paths) > 1 }
+
+// Remove deletes the residue, finalizing a rotation. It is irreversible, and
+// it also renders unreadable any backup taken before the rotation.
+func (r *Residue) Remove() error {
+	for _, p := range r.Paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("seal: removing %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func contains(xs []string, x string) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
 // RootKeyWrappedBy reports which seal and wrapping key currently hold the root
 // key, without needing either seal to be available.
 func RootKeyWrappedBy(dir string) (string, error) {
