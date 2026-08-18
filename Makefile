@@ -73,3 +73,10 @@ build-hsm: $(BUILD_DIR)
 	@$(SYNC)
 	@cd $(BUILD_DIR) && CGO_ENABLED=1 go build -tags pkcs11 -o signet-hsm ./cmd/signet
 	@echo "built $(BUILD_DIR)/signet-hsm"
+
+# End-to-end trust bundle ceremony: offline root -> two issuers -> signed
+# bundle -> two consumers choosing different anchors, verified with openssl.
+.PHONY: test-trust
+test-trust: build
+	@cp $(BIN) ./signet-testbin
+	@BIN=$(PWD)/signet-testbin ./test/trust/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s

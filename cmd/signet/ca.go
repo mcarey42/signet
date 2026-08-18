@@ -8,11 +8,13 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mcarey42/signet/internal/ca"
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/seal"
+	"github.com/mcarey42/signet/internal/trust"
 )
 
 // The CA ceremonies are separate commands because they happen in separate
@@ -34,6 +36,7 @@ const caUsage = `signet ca — certificate authority ceremonies
   sign-issuer  sign a node's request with the root, delegating a namespace
   install      install a signed issuer certificate on this node
   issuers      list the issuing authorities in this domain
+  bundle       publish the domain's signed trust bundle (offline, with the root)
 `
 
 func cmdCA(args []string) error {
@@ -52,6 +55,8 @@ func cmdCA(args []string) error {
 		return caInstall(args[1:])
 	case "issuers":
 		return caIssuers(args[1:])
+	case "bundle":
+		return caBundle(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(caUsage)
 		return nil
@@ -263,6 +268,13 @@ func caSignIssuer(args []string) error {
 	if err := os.WriteFile(*out, issuerPEM, 0o644); err != nil {
 		return err
 	}
+	// Keep a copy beside the root. The bundle ceremony runs here, offline, and
+	// needs every issuer it has ever certified; hunting them back down from the
+	// nodes afterwards would be the wrong direction of travel.
+	if err := recordIssuerCopy(*rootDir, issuerPEM); err != nil {
+		return fmt.Errorf("ca sign-issuer: recording the issuer copy: %w", err)
+	}
+
 	fmt.Printf("issuer certificate written to %s\n", *out)
 	fmt.Printf("  delegated namespace: %v\n", splitList(*domains))
 	fmt.Printf("  valid for:           %s\n", *ttl)
@@ -374,4 +386,20 @@ func caIssuers(args []string) error {
 		fmt.Printf("%-28s %-12s %s\n", name, custody, where)
 	}
 	return nil
+}
+
+// recordIssuerCopy files a signed issuer under the root directory, named by its
+// public key so re-signing the same key replaces the entry instead of
+// accumulating stale duplicates in every future bundle.
+func recordIssuerCopy(rootDir string, issuerPEM []byte) error {
+	cert, err := parseCertPEM(issuerPEM)
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(rootDir, "issuers")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	fp := strings.TrimPrefix(trust.Fingerprint(cert), "sha256:")
+	return os.WriteFile(filepath.Join(dir, fp+".crt"), issuerPEM, 0o644)
 }

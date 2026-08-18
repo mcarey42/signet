@@ -357,6 +357,12 @@ func (k *Kernel) PutSSHRole(ctx context.Context, grantor op.ID, name string, rol
 	return err
 }
 
+// Authorize checks a session's authority for a verb at a scope, for dialects
+// that must refuse before doing work.
+func (k *Kernel) Authorize(ctx context.Context, s Session, v Verb, scope string) error {
+	return k.authorize(s, v, scope)
+}
+
 // AuthorizeSign checks signing authority at a scope, for dialects that need to
 // refuse before doing expensive work.
 func (k *Kernel) AuthorizeSign(ctx context.Context, s Session, scope string) error {

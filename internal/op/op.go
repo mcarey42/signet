@@ -27,23 +27,24 @@ const FormatVersion uint16 = 1
 type Kind uint16
 
 const (
-	KindInvalid       Kind = 0
-	KindPutPrincipal  Kind = 1
-	KindPutBinding    Kind = 2
-	KindPutSecret     Kind = 3
-	KindCreateSession Kind = 4
-	KindRevokeSession Kind = 5
-	KindPutIssuer     Kind = 6
-	KindPutMapping    Kind = 7
-	KindVersionAction Kind = 8
-	KindDestroySecret Kind = 9
-	KindPutSecretMeta Kind = 10
-	KindPutCA         Kind = 11
-	KindPutPKIRole    Kind = 12
-	KindRecordIssue   Kind = 13
-	KindPutRolePolicy Kind = 14
-	KindPutKey        Kind = 15
-	KindPutSSHRole    Kind = 16
+	KindInvalid        Kind = 0
+	KindPutPrincipal   Kind = 1
+	KindPutBinding     Kind = 2
+	KindPutSecret      Kind = 3
+	KindCreateSession  Kind = 4
+	KindRevokeSession  Kind = 5
+	KindPutIssuer      Kind = 6
+	KindPutMapping     Kind = 7
+	KindVersionAction  Kind = 8
+	KindDestroySecret  Kind = 9
+	KindPutSecretMeta  Kind = 10
+	KindPutCA          Kind = 11
+	KindPutPKIRole     Kind = 12
+	KindRecordIssue    Kind = 13
+	KindPutRolePolicy  Kind = 14
+	KindPutKey         Kind = 15
+	KindPutSSHRole     Kind = 16
+	KindPutTrustBundle Kind = 17
 )
 
 func (k Kind) String() string {
@@ -80,6 +81,8 @@ func (k Kind) String() string {
 		return "PutKey"
 	case KindPutSSHRole:
 		return "PutSSHRole"
+	case KindPutTrustBundle:
+		return "PutTrustBundle"
 	}
 	return fmt.Sprintf("Kind(%d)", uint16(k))
 }
@@ -245,6 +248,21 @@ type PutSSHRole struct {
 	Grantor ID     `json:"grantor"`
 }
 
+// PutTrustBundle stores the domain's root-signed trust bundle so every node
+// serves the identical artifact.
+//
+// The bundle is opaque here on purpose. It was signed by the offline root, and
+// re-encoding it would invalidate that signature — so it is carried and stored
+// as the exact bytes that were signed, and this node's opinion of its contents
+// never enters into it.
+type PutTrustBundle struct {
+	Header
+	Domain  string `json:"domain"`
+	Epoch   uint64 `json:"epoch"`
+	Bundle  []byte `json:"bundle"`
+	Grantor ID     `json:"grantor"`
+}
+
 // PutIssuer registers a pinned attestation trust anchor: the exact `iss` value
 // tokens must carry, the Signet-specific audience they must be minted for, and
 // the key set that verifies them. Keys are registered out of band and never
@@ -294,6 +312,7 @@ func (RecordIssuance) OpKind() Kind { return KindRecordIssue }
 func (PutRolePolicy) OpKind() Kind  { return KindPutRolePolicy }
 func (PutKey) OpKind() Kind         { return KindPutKey }
 func (PutSSHRole) OpKind() Kind     { return KindPutSSHRole }
+func (PutTrustBundle) OpKind() Kind { return KindPutTrustBundle }
 
 // Result is what Apply computes for one Op. It is returned to the proposer
 // through the consensus future; it is never persisted, so Err may be a plain
@@ -382,6 +401,9 @@ func Decode(b []byte) (Op, error) {
 		err, o = json.Unmarshal(e.Body, &v), &v
 	case KindPutSSHRole:
 		var v PutSSHRole
+		err, o = json.Unmarshal(e.Body, &v), &v
+	case KindPutTrustBundle:
+		var v PutTrustBundle
 		err, o = json.Unmarshal(e.Body, &v), &v
 	default:
 		return nil, fmt.Errorf("op: unknown kind %d", uint16(e.K))

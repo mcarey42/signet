@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/op"
+	"github.com/mcarey42/signet/internal/trust"
 )
 
 // Status is the server-side view sys/health reports. Sealing and consensus are
@@ -108,6 +110,18 @@ func (h *Handler) Routes() *http.ServeMux {
 
 	h.pkiRoutes(mux)
 
+	// The trust bundle is served unauthenticated on purpose. It contains
+	// certificates and metadata a consumer is meant to have before it trusts
+	// anything here, so requiring a credential to fetch it would invert the
+	// bootstrap: you would need trust to obtain the means of establishing trust.
+	// Its integrity comes from the root's signature, not from this transport.
+	mux.HandleFunc("GET /v1/trust/bundle", h.trustBundle)
+	// Publishing, by contrast, is an authorized write. It must be reachable on
+	// a running node: a bundle expires and has to be replaced on a schedule, and
+	// requiring a restart to accept a new one would make expiry an outage.
+	mux.HandleFunc("PUT /v1/trust/bundle", h.putTrustBundle)
+	mux.HandleFunc("POST /v1/trust/bundle", h.putTrustBundle)
+
 	mux.HandleFunc("/", h.notFound)
 	return mux
 }
@@ -119,6 +133,51 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- routes ---------------------------------------------------------------
+
+func (h *Handler) putTrustBundle(w http.ResponseWriter, r *http.Request) {
+	s, err := h.session(r)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied")
+		return
+	}
+	// Replacing what a domain trusts is an administrative act at the root of
+	// the tree, so it needs authority there — not merely a valid session.
+	if err := h.k.Authorize(r.Context(), s, kernel.VerbAdmin, "/"); err != nil {
+		writeErr(w, http.StatusForbidden, "permission denied: publishing a trust bundle needs admin authority at /")
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "unreadable body")
+		return
+	}
+	// The kernel re-verifies against the root this node's own issuer chains to,
+	// so an admin session is permission to publish, not permission to redefine
+	// the trust set.
+	if err := h.k.PutTrustBundle(r.Context(), s.Principal, raw); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	p, err := trust.PayloadOfBytes(raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(map[string]any{"domain": p.Domain, "epoch": p.Epoch}))
+}
+
+func (h *Handler) trustBundle(w http.ResponseWriter, r *http.Request) {
+	raw, err := h.k.TrustBundle(r.Context(), r.URL.Query().Get("domain"))
+	if err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	// Served byte for byte as the root signed it. Re-encoding would break the
+	// signature, so the bundle is opaque to this handler.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
+}
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	st := Status{Initialized: true}

@@ -48,6 +48,7 @@ const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
   signet seal status -data-dir DIR               show which seal holds the keys
   signet seal rotate -data-dir DIR -to URI       move key custody to another seal
   signet ca ...                                  CA ceremonies (see: signet ca help)
+  signet trust ...                               trust bundles (see: signet trust help)
 `
 
 func main() {
@@ -67,6 +68,8 @@ func main() {
 		err = cmdKV(os.Args[2:])
 	case "seal":
 		err = cmdSeal(os.Args[2:])
+	case "trust":
+		err = cmdTrust(os.Args[2:])
 	case "ca":
 		err = cmdCA(os.Args[2:])
 	case "-h", "--help", "help":
@@ -919,12 +922,22 @@ func openNode(dataDir, sealURI string) (*fsm.Node, *kernel.Kernel, error) {
 //	-seal 'pkcs11:?module=/usr/lib/softhsm/libsofthsm2.so&token=signet&pin=1234&label=signet-seal'
 func sealURI(dataDir, override string) string {
 	if override == "" {
-		return "file://" + dataDir + "/seal.key"
+		return fileSealURI(filepath.Join(dataDir, "seal.key"))
 	}
 	if strings.Contains(override, "://") || strings.HasPrefix(override, "pkcs11:") {
 		return override
 	}
-	return "file://" + override
+	return fileSealURI(override)
+}
+
+// fileSealURI makes the path absolute first. A relative path in a file:// URL
+// parses its first segment as a host, which used to resolve the seal to
+// /seal.key and fail with an error naming a file the operator never mentioned.
+func fileSealURI(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return "file://" + path
 }
 
 func jsonMarshal(v any) ([]byte, error)   { return json.MarshalIndent(v, "", "  ") }

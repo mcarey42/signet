@@ -74,7 +74,10 @@ func Open(uri string) (Seal, error) {
 	}
 	switch u.Scheme {
 	case "file":
-		path := u.Path
+		// "file://relative/seal.key" parses with "relative" as the HOST and
+		// "/seal.key" as the path, so taking u.Path alone would silently open
+		// the wrong file at the filesystem root. Rejoin them.
+		path := u.Host + u.Path
 		if path == "" {
 			path = u.Opaque
 		}

@@ -272,6 +272,45 @@ makes rotating a pinned intermediate a publish-ahead-then-retire operation on
 the same refresh path everything else already uses. Bundle mechanics, epochs,
 and staleness rules are E-12.
 
+### 5. Built and measured (2026-08-17, milestone 4b)
+
+`internal/trust` implements the above; `signet ca bundle` publishes and
+`signet trust fetch|verify|show|pin|install` consume. Three findings from
+running it against real verifiers, one of which changes the guidance.
+
+**The root signs bundles, so publishing is a root ceremony.** A bundle declares
+the trust set, and an *issuing* key is authorized to mint leaves within a
+namespace — not to say who is trusted. Had issuers been allowed to sign
+bundles, compromising one node would compromise the whole trust fabric, since
+that node could publish a bundle naming itself an anchor. The cost is that
+withdrawing an issuer needs the offline root. That is the right cost: it is a
+rare, serious event, and the design already leans on short lifetimes rather
+than revocation lists for everything routine.
+
+**Pinning an intermediate is verifier-dependent — measured, not assumed.**
+Anchoring on a non-self-signed certificate is accepted by Go's `crypto/x509`
+(any cert in the root pool is a valid anchor) and **refused by OpenSSL** unless
+run with `-partial_chain`. Same bundle, same anchor, opposite results, for
+reasons unrelated to the certificates. This is the E-02 finding again in a new
+place: *enforcement is not uniform across verifiers, so it cannot be assumed*.
+The pinned mode therefore ships with a warning printed at the moment an
+operator selects it, naming the flag, rather than being silently offered as
+equivalent to the cascade mode. A self-signed "pseudo-root" variant — the
+issuing node re-signing its own certificate as a self-signed anchor — is the
+portable alternative and remains open (E-12).
+
+**Bundle revocation binds only consumers that build their own paths.**
+`signet trust fetch -issuers-out` writes the surviving issuer set with
+withdrawn ones omitted, which is what makes revocation bite; a consumer that
+instead accepts whatever chain a server presents, under the root anchor, will
+not notice. Withdrawing an issuer in a bundle is therefore a *complement to*
+letting its short-lived certificate expire, never a substitute for it.
+
+Rollback is refused in two independent places: at the consumer, against its
+remembered epoch (`internal/trust.State`, persisted so it survives restarts),
+and inside `Apply`, so a node cannot be walked backwards through the log
+either. Staleness fails closed on both paths.
+
 ## Crypto-agility: PQC-hedged composite roots (Decided)
 
 The trust anchor is **crypto-agile from day one** so an algorithm can be
@@ -351,11 +390,16 @@ token; TOFU is permitted only where explicitly enabled.
 
 ## Open questions
 
-- Bundle format: SPIFFE bundle endpoint format vs. our own signed document.
-  Leaning SPIFFE-compatible (reinforced by E-02). → Mission E-12.
-- Revocation transport between domains (signed revocation lists piggybacked
-  on bundle refresh? epoch counters?). Note short-lived intermediates already
-  bound subtree revocation at ≤ intermediate lifetime.
+- Bundle format: shipped as our own signed document (base64 payload + ECDSA
+  signature over the exact transmitted bytes, `internal/trust`). SPIFFE bundle
+  endpoint compatibility remains open and is now an interop question rather
+  than a design one. → Mission E-12.
+- **Online freshness statements**: revocation currently rides the root-signed
+  bundle, so withdrawing an issuer needs a ceremony. A delegated online key
+  signing short-lived revocation deltas is the natural extension once
+  leaf-level revocation is needed. → E-12.
+- **Self-signed pseudo-root variant** for portable intermediate pinning, given
+  the OpenSSL `-partial_chain` finding above. → E-12.
 - **Issuance-log audit protocol** (new, from E-02): format, what the parent
   verifies at renewal, and whether logs are hash-chained (ties into 11's
   audit-log question). Feeds 01/03.
