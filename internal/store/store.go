@@ -125,6 +125,26 @@ func (s *Store) Update(term, index uint64, fn func(*Tx) error) error {
 	})
 }
 
+// SealHighWaterMark reports the highest log index ever sealed here, and whether
+// one has ever been recorded.
+//
+// It is the one durable fact about a store that survives losing the barrier
+// key, so it is what tells a starting node whether this store has EVER been
+// written — a question "is it empty?" cannot answer, because a store whose key
+// is gone and a store that is genuinely new look identical from the inside.
+func (s *Store) SealHighWaterMark() (uint64, bool, error) {
+	var (
+		hwm uint64
+		ok  bool
+	)
+	err := s.db.View(func(btx *bolt.Tx) error {
+		var e error
+		hwm, ok, e = readSealHWM(btx)
+		return e
+	})
+	return hwm, ok, err
+}
+
 // metaSealHWM is stored unencrypted, on purpose. See Update.
 const metaSealHWM = "seal_high_water_mark"
 

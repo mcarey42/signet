@@ -98,6 +98,34 @@ func Open(cfg Config) (*Node, error) {
 		return nil, err
 	}
 
+	// A log that expects state, beside a store that has never held any.
+	//
+	// Losing state.db and root.seal together is silent otherwise: a fresh store
+	// and a fresh root key are created, every entry in the surviving log fails
+	// to decrypt under the new barrier, and the node comes up reporting
+	// initialized, unsealed, leader — serving a populated domain as an empty
+	// one. Reads say "not found" and writes succeed, which is the worst
+	// possible answer to give about a secrets store.
+	//
+	// The seal high-water mark is the tell: it is plaintext, so it survives
+	// losing the key, and its absence beside a non-empty log means this store is
+	// not the one that log belongs to.
+	if hasState {
+		if _, everWritten, err := st.SealHighWaterMark(); err != nil {
+			logs.Close()
+			st.Close()
+			return nil, err
+		} else if !everWritten {
+			logs.Close()
+			st.Close()
+			return nil, fmt.Errorf(
+				"refusing to start: %s holds an existing Raft log, but this store has never been "+
+					"written to. The state was lost or replaced while the log survived, and starting "+
+					"would serve a populated domain as an empty one. Restore state.db and root.seal "+
+					"together with raft.db, from the same point in time", cfg.DataDir)
+		}
+	}
+
 	machine, err := New(st)
 	if err != nil {
 		return nil, err

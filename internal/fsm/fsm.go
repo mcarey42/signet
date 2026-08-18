@@ -6,6 +6,7 @@ package fsm
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -60,9 +61,23 @@ func New(st *store.Store) (*FSM, error) {
 // the last snapshot on restart, but this FSM's state is durable — so without
 // the watermark, replayed entries would apply a second time on top of their own
 // results and any accumulating value (a secret's version counter) would drift.
+// ErrAlreadyApplied is returned for an entry at or below the watermark.
+//
+// During ordinary replay nobody reads this — Raft is re-feeding entries whose
+// effects are already durable, which is exactly what the watermark is for. It
+// matters for a PROPOSAL: a client's write that lands at an already-applied
+// index stored nothing, and used to be reported as success because a skipped
+// Apply returned an empty result indistinguishable from a real one. That is how
+// losing raft.db while state.db survived swallowed a whole prefix of the write
+// stream, silently, with 200s all the way.
+var ErrAlreadyApplied = errors.New(
+	"this log index has already been applied to the store, so the write stored nothing. " +
+		"The log is behind the state it describes — usually a lost or restored raft.db beside a " +
+		"surviving state.db. Do not treat this as success; restore the pair together")
+
 func (f *FSM) Apply(l *raft.Log) any {
 	if l.Index <= f.applied.Load() {
-		return op.Result{}
+		return op.Result{Err: ErrAlreadyApplied}
 	}
 	defer metrics.Time(metrics.ApplyDuration)()
 	pt, err := f.st.Barrier().Open(l.Data, opAAD)

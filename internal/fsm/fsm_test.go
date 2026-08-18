@@ -2,12 +2,15 @@ package fsm_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/raft"
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
 )
@@ -180,5 +183,45 @@ func TestFSMRefusesToStartWithoutItsWatermark(t *testing.T) {
 	defer s2.Close()
 	if _, err := fsm.New(s2); err == nil {
 		t.Fatal("the FSM started despite being unable to read its watermark; it would replay the log and reuse nonces")
+	}
+}
+
+// A write that lands at an already-applied index stored nothing, and must not
+// be reported as success.
+//
+// Apply returned a bare op.Result{} when skipping, indistinguishable from a
+// real empty result, so Propose handed the caller (empty, nil) — success. With
+// raft.db lost beside a surviving state.db, a fresh log restarts at index 1 and
+// a whole prefix of the write stream was swallowed: 200s all the way, nothing
+// stored, and no audit record either.
+func TestSkippedEntryIsNotReportedAsSuccess(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 3)
+	}
+	s, err := store.Open(filepath.Join(dir, "state.db"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Update(1, 9, func(tx *store.Tx) error { return tx.SetAppliedIndex(9) }); err != nil {
+		t.Fatal(err)
+	}
+	machine, err := fsm.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replay an entry the store has already applied.
+	res, ok := machine.Apply(&raft.Log{Index: 4, Term: 1, Data: []byte("anything")}).(op.Result)
+	if !ok {
+		t.Fatalf("unexpected apply result type")
+	}
+	if res.Err == nil {
+		t.Fatal("a skipped entry reported success; a caller would believe its write landed")
+	}
+	if !errors.Is(res.Err, fsm.ErrAlreadyApplied) {
+		t.Fatalf("expected ErrAlreadyApplied, got: %v", res.Err)
 	}
 }
