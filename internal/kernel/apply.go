@@ -378,7 +378,9 @@ func NewAuditRecord(term, index uint64, o op.Op, res op.Result) ([]byte, error) 
 	case *op.PutTrustBundle:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("%s epoch %d", v.Domain, v.Epoch)
 	case *op.PutWitness:
-		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, "witness "+v.Domain
+		// The domain comes from Apply, which is the only place that has
+		// verified whose checkpoint this actually is.
+		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, "witness "+res.Subject
 	case *op.RequestActivation:
 		r.Actor, r.AtSec, r.Subject = v.Actor, v.AtSec, fmt.Sprintf("activation %s: %s", v.ID, v.Reason)
 	case *op.ActivationAction:

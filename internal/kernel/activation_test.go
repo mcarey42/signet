@@ -1,7 +1,11 @@
 package kernel
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
+	"github.com/mcarey42/signet/internal/audit"
 	"strings"
 	"testing"
 	"time"
@@ -603,4 +607,156 @@ func TestBindingAuditRecordNamesRoleAndRecipient(t *testing.T) {
 			t.Fatalf("the record should name %q: %s", want, admin)
 		}
 	}
+}
+
+// Witnessing a domain for the first time is administrative.
+//
+// Any principal with write authority could self-sign a checkpoint for ANY
+// domain name using their own key, have it pinned, and permanently lock out the
+// real domain — the witness would thereafter refuse the genuine article as a
+// key change. Pinning decides who this node believes for a name; that is not a
+// routine write.
+func TestEstablishingANewWitnessedDomainNeedsAdmin(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		key, cp, entries, pub := testCheckpoint(t, "victim.example.net", 3)
+
+		// bob can write but is not an admin.
+		bindPAM(t, tx, Binding{ID: "b-bob", Subject: bob, Role: "kv-writer", Scope: "/"})
+		res := applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: bob, AtSec: 1000},
+			Checkpoint: cp, Entries: entries, PubKeyPEM: pub, Grantor: bob,
+		})
+		if res.Err == nil {
+			t.Fatal("a non-admin pinned a key for a domain this node had never seen")
+		}
+		if !strings.Contains(res.Err.Error(), "admin authority at /") {
+			t.Fatalf("unhelpful refusal: %v", res.Err)
+		}
+		if _, ok, _ := tx.Get(store.BucketWitness, "victim.example.net"); ok {
+			t.Fatal("a record was written despite the refusal")
+		}
+
+		// carol, an admin, may establish it.
+		bindPAM(t, tx, Binding{ID: "b-carol", Subject: carol, Role: "domain-admin", Scope: "/"})
+		res = applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: carol, AtSec: 1000},
+			Checkpoint: cp, Entries: entries, PubKeyPEM: pub, Grantor: carol,
+		})
+		if res.Err != nil {
+			t.Fatalf("an admin should be able to establish a witnessed domain: %v", res.Err)
+		}
+
+		// And once established, an ordinary writer may extend it.
+		cp2, ents2 := testExtension(t, key, "victim.example.net", 3, 2)
+		if res := applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: bob, AtSec: 1100},
+			Checkpoint: cp2, Entries: ents2, PubKeyPEM: pub, Grantor: bob,
+		}); res.Err != nil {
+			t.Fatalf("extending an established record should not need admin: %v", res.Err)
+		}
+	})
+}
+
+// A stored conflict is the evidence the mechanism exists to hold, so nothing
+// may overwrite it — including a later witnessing that would otherwise succeed.
+func TestAStoredConflictCannotBeOverwritten(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		bindPAM(t, tx, Binding{ID: "b-carol", Subject: carol, Role: "domain-admin", Scope: "/"})
+		key, cp, entries, pub := testCheckpoint(t, "home.example.net", 3)
+		if res := applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: carol, AtSec: 1000},
+			Checkpoint: cp, Entries: entries, PubKeyPEM: pub, Grantor: carol,
+		}); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+
+		// A forked history at the same count: different head, same number.
+		_, forkedCP, _, _ := testCheckpointWithKey(t, key, "home.example.net", 3, "forked")
+		res := applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: carol, AtSec: 1100},
+			Checkpoint: forkedCP, PubKeyPEM: pub, Grantor: carol,
+		})
+		if res.Err == nil {
+			t.Fatal("a rewritten history was accepted")
+		}
+		raw, _, _ := tx.Get(store.BucketWitness, "home.example.net")
+		if !strings.Contains(string(raw), "conflict") {
+			t.Fatalf("the conflict was not persisted: %s", raw)
+		}
+
+		// A subsequent, otherwise-valid witnessing must not clear it.
+		if res := applyPutWitness(tx, &op.PutWitness{
+			Header:     op.Header{Actor: carol, AtSec: 1200},
+			Checkpoint: cp, Entries: entries, PubKeyPEM: pub, Grantor: carol,
+		}); res.Err == nil {
+			t.Fatal("a later witnessing cleared a stored conflict")
+		}
+		raw, _, _ = tx.Get(store.BucketWitness, "home.example.net")
+		if !strings.Contains(string(raw), "conflict") {
+			t.Fatal("the conflict was erased by a later call")
+		}
+	})
+}
+
+// --- witness test helpers -------------------------------------------------
+
+func testKeyPair(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// testCheckpoint builds a fresh chain of n entries and a signed checkpoint over
+// it, returning the signing key, the checkpoint, the entries, and the key PEM.
+func testCheckpoint(t *testing.T, domain string, n int) (*ecdsa.PrivateKey, []byte, []byte, string) {
+	t.Helper()
+	key := testKeyPair(t)
+	cp, ents, pub := buildCheckpoint(t, key, domain, store.GenesisHead(), 0, n, "real")
+	return key, cp, ents, pub
+}
+
+func testCheckpointWithKey(t *testing.T, key *ecdsa.PrivateKey, domain string, n int, tag string) (*ecdsa.PrivateKey, []byte, []byte, string) {
+	t.Helper()
+	cp, ents, pub := buildCheckpoint(t, key, domain, store.GenesisHead(), 0, n, tag)
+	return key, cp, ents, pub
+}
+
+func testExtension(t *testing.T, key *ecdsa.PrivateKey, domain string, from, n int) ([]byte, []byte) {
+	t.Helper()
+	head := store.GenesisHead()
+	for i := 1; i <= from; i++ {
+		rec, _ := jsonMarshalB(map[string]any{"kind": "PutSecret", "tag": "real", "i": i})
+		head = store.ChainHash(head, rec)
+	}
+	cp, ents, _ := buildCheckpoint(t, key, domain, head, uint64(from), n, "real")
+	return cp, ents
+}
+
+func buildCheckpoint(t *testing.T, key *ecdsa.PrivateKey, domain, head string,
+	from uint64, n int, tag string) (cpJSON, entsJSON []byte, pubPEM string) {
+	t.Helper()
+	var ents []store.AuditEntry
+	seq := from
+	for i := 1; i <= n; i++ {
+		seq++
+		rec, _ := jsonMarshalB(map[string]any{"kind": "PutSecret", "tag": tag, "i": int(seq)})
+		h := store.ChainHash(head, rec)
+		ents = append(ents, store.AuditEntry{Seq: seq, Prev: head, Hash: h, Record: rec})
+		head = h
+	}
+	signed, err := audit.Sign(&audit.Checkpoint{
+		Domain: domain, Count: seq, Head: head, AtSec: 1000}, "kid", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpJSON, _ = jsonMarshalB(signed)
+	entsJSON, _ = jsonMarshalB(ents)
+	pem, err := encodePublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cpJSON, entsJSON, pem
 }

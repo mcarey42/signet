@@ -287,11 +287,23 @@ type PutTrustBundle struct {
 // PutWitness records what this node has witnessed of another domain's audit
 // chain. It is ordinary durable state: a witness that forgot on restart would
 // be no witness at all.
+// PutWitness carries the INPUTS to a witnessing decision, not its outcome.
+//
+// The merge used to happen outside Apply: read the prior record, compute the
+// new one, propose the result. Two concurrent witness calls therefore both read
+// the same prior state and the later write won — which could ERASE a stored
+// conflict, destroying the one piece of evidence the whole mechanism exists to
+// hold. Carrying the inputs lets Apply do the read-modify-write under the
+// serialized writer, where it cannot race.
+//
+// Verifying an ECDSA signature and replaying a hash chain are both
+// deterministic, so this keeps Apply pure.
 type PutWitness struct {
 	Header
-	Domain  string `json:"domain"`
-	Record  []byte `json:"record"`
-	Grantor ID     `json:"grantor"`
+	Checkpoint []byte `json:"checkpoint"` // the signed checkpoint, as transmitted
+	Entries    []byte `json:"entries"`    // JSON array of audit entries justifying it
+	PubKeyPEM  string `json:"pubkey"`
+	Grantor    ID     `json:"grantor"`
 }
 
 // RequestActivation asks to hold an authority the requester is merely eligible

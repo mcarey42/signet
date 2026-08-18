@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mcarey42/signet/internal/audit"
 	"github.com/mcarey42/signet/internal/keys"
@@ -117,79 +118,42 @@ func (k *Kernel) AuditPublicKey(ctx context.Context) (*ecdsa.PublicKey, string, 
 // rather than merely returned: the whole value of a witness is that it holds
 // evidence after the fact, and evidence that vanished with the error would be
 // worth nothing.
+// Witness hands another domain's checkpoint to this node, which verifies it and
+// records the result.
+//
+// This is now a thin proposer: everything that decides anything happens inside
+// Apply, serialized by consensus. pub is the peer's checkpoint key, and Apply
+// re-verifies against it rather than trusting that this call did.
 func (k *Kernel) Witness(ctx context.Context, grantor op.ID, signed *audit.Signed,
 	entries []store.AuditEntry, pub *ecdsa.PublicKey) (*audit.Witnessed, error) {
 
-	c, err := audit.Open(signed, pub)
+	cp, err := json.Marshal(signed)
 	if err != nil {
 		return nil, err
 	}
-	if c.Domain == "" {
-		return nil, errors.New("this checkpoint names no domain, so there is nothing to witness it for")
-	}
-
-	prior, err := k.Witnessed(ctx, c.Domain)
+	ents, err := json.Marshal(entries)
 	if err != nil {
 		return nil, err
 	}
-	if prior == nil {
-		prior = &audit.Witnessed{}
-	}
-	if prior.Conflict != nil {
-		return prior, fmt.Errorf(
-			"this witness already holds proof that %q rewrote its log (%s). Further checkpoints are "+
-				"not accepted until that is resolved deliberately", c.Domain, prior.Conflict.Reason)
-	}
-	if prior.First == nil {
-		prior.First = signed
-	}
-	// Pin the checkpoint key on first sight and refuse a silent change. The
-	// caller has already verified against `pub`; this is what stops a later
-	// call quietly substituting a different key and continuing the record.
-	pinned, err := encodePublicKey(pub)
+	pem, err := encodePublicKey(pub)
 	if err != nil {
 		return nil, err
 	}
-	if prior.PinnedKey == "" {
-		prior.PinnedKey = pinned
-	} else if prior.PinnedKey != pinned {
-		// A changed checkpoint key is itself evidence, so it is recorded rather
-		// than merely refused: a node rebuilt from scratch loses its audit key,
-		// which is one of the more common shapes a rewrite actually takes.
-		prior.Conflict = &audit.Conflict{
-			DetectedAt: k.now().Unix(), Count: c.Count, Was: prior.Head, Now: c.Head,
-			Reason: fmt.Sprintf(
-				"%q now signs its checkpoints with a different key than the one this witness "+
-					"pinned. Either it rotated its audit key without telling anyone, or this is "+
-					"not the same domain any more", c.Domain),
-		}
-		if err := k.storeWitness(ctx, grantor, c.Domain, prior); err != nil {
-			return prior, err
-		}
-		return prior, errors.New(prior.Conflict.Reason)
-	}
-
-	extendErr := prior.Extend(c, entries, k.now())
-	if extendErr == nil {
-		prior.Checkpoint = signed
-	}
-	// Persist either way. On success this advances the witnessed head; on a
-	// conflict it stores the proof, which is the whole reason a witness exists.
-	if err := k.storeWitness(ctx, grantor, c.Domain, prior); err != nil {
-		return prior, err
-	}
-	return prior, extendErr
-}
-
-func (k *Kernel) storeWitness(ctx context.Context, grantor op.ID, domain string, w *audit.Witnessed) error {
-	blob, err := json.Marshal(w)
+	claim, err := signed.Claim()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = k.prop.Propose(ctx, &op.PutWitness{
-		Header: k.header(grantor), Domain: domain, Record: blob, Grantor: grantor,
+	_, proposeErr := k.prop.Propose(ctx, &op.PutWitness{
+		Header: k.header(grantor), Checkpoint: cp, Entries: ents,
+		PubKeyPEM: pem, Grantor: grantor,
 	})
-	return err
+	// Read back what was recorded either way: on a conflict the caller wants
+	// the evidence, not just the error.
+	rec, readErr := k.Witnessed(ctx, claim.Domain)
+	if readErr != nil {
+		return nil, readErr
+	}
+	return rec, proposeErr
 }
 
 // Witnessed returns what this node holds for a domain, or nil.
@@ -251,14 +215,107 @@ func ParsePublicKeyPEM(p []byte) (*ecdsa.PublicKey, error) {
 	return ec, nil
 }
 
+// applyPutWitness verifies a peer checkpoint and merges it into what this node
+// already holds — all of it here, under the serialized writer.
 func applyPutWitness(tx *store.Tx, o *op.PutWitness) op.Result {
-	if o.Domain == "" {
-		return op.Result{Err: errors.New("witness: missing domain")}
+	var signed audit.Signed
+	if err := json.Unmarshal(o.Checkpoint, &signed); err != nil {
+		return op.Result{Err: fmt.Errorf("witness: unreadable checkpoint: %w", err)}
 	}
-	if err := tx.Put(store.BucketWitness, o.Domain, o.Record); err != nil {
+	pub, err := ParsePublicKeyPEM([]byte(o.PubKeyPEM))
+	if err != nil {
+		return op.Result{Err: fmt.Errorf("witness: %w", err)}
+	}
+	c, err := audit.Open(&signed, pub)
+	if err != nil {
 		return op.Result{Err: err}
 	}
-	return op.Result{}
+	if c.Domain == "" {
+		return op.Result{Err: errors.New("witness: this checkpoint names no domain")}
+	}
+	var entries []store.AuditEntry
+	if len(o.Entries) > 0 {
+		if err := json.Unmarshal(o.Entries, &entries); err != nil {
+			return op.Result{Err: fmt.Errorf("witness: unreadable entries: %w", err)}
+		}
+	}
+
+	prior := &audit.Witnessed{}
+	raw, ok, err := tx.Get(store.BucketWitness, c.Domain)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if ok {
+		if err := json.Unmarshal(raw, prior); err != nil {
+			return op.Result{Err: err}
+		}
+	} else {
+		// Beginning to witness a domain decides what this node will hold
+		// evidence ABOUT, and pins the key it will believe. Left open to any
+		// writer, anyone could self-sign a checkpoint for a name they do not
+		// own, get their key pinned, and permanently lock out the real domain.
+		// Establishing a new one is therefore administrative; extending an
+		// existing record is not.
+		allowed, err := HasAuthority(tx, o.Grantor, VerbAdmin, "/", o.AtSec)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if !allowed {
+			return op.Result{Err: fmt.Errorf(
+				"witness: beginning to witness %q requires admin authority at /. Pinning a key for "+
+					"a domain this node has never seen decides who it will believe for that name, "+
+					"and it cannot be undone by whoever asks next", c.Domain)}
+		}
+	}
+
+	if prior.Conflict != nil {
+		return op.Result{Err: fmt.Errorf(
+			"witness: this node already holds proof that %q rewrote its log (%s). Further "+
+				"checkpoints are not accepted until that is resolved deliberately",
+			c.Domain, prior.Conflict.Reason)}
+	}
+
+	pinned := string(o.PubKeyPEM)
+	if prior.PinnedKey == "" {
+		prior.PinnedKey = pinned
+	} else if prior.PinnedKey != pinned {
+		prior.Conflict = &audit.Conflict{
+			DetectedAt: o.AtSec, Count: c.Count, Was: prior.Head, Now: c.Head,
+			Reason: fmt.Sprintf(
+				"%q now signs its checkpoints with a different key than the one this witness "+
+					"pinned. Either it rotated its audit key without telling anyone, or this is "+
+					"not the same domain any more", c.Domain),
+		}
+		if err := storeWitnessRecord(tx, c.Domain, prior); err != nil {
+			return op.Result{Err: err}
+		}
+		return op.Result{Err: errors.New(prior.Conflict.Reason)}
+	}
+	if prior.First == nil {
+		prior.First = &signed
+	}
+
+	extendErr := prior.Extend(c, entries, time.Unix(o.AtSec, 0))
+	if extendErr == nil {
+		prior.Checkpoint = &signed
+	}
+	// Stored either way: on success this advances the head, on a conflict it
+	// keeps the proof, which is the whole reason a witness exists.
+	if err := storeWitnessRecord(tx, c.Domain, prior); err != nil {
+		return op.Result{Err: err}
+	}
+	if extendErr != nil {
+		return op.Result{Err: extendErr}
+	}
+	return op.Result{Subject: c.Domain}
+}
+
+func storeWitnessRecord(tx *store.Tx, domain string, w *audit.Witnessed) error {
+	blob, err := json.Marshal(w)
+	if err != nil {
+		return err
+	}
+	return tx.Put(store.BucketWitness, domain, blob)
 }
 
 // EnsureAuditKey creates the checkpoint signing key if the domain has none.
