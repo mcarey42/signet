@@ -418,7 +418,9 @@ func (k *Kernel) PutPrincipal(ctx context.Context, actor op.ID, id op.ID, path, 
 			return "", err
 		}
 	}
-	res, err := k.prop.Propose(ctx, &op.PutPrincipal{Header: k.header(actor), ID: id, Path: path, Type: typ})
+	res, err := k.prop.Propose(ctx, &op.PutPrincipal{
+		Header: k.header(actor), ID: id, Path: path, Type: typ, Grantor: actor,
+	})
 	if err != nil {
 		return "", err
 	}

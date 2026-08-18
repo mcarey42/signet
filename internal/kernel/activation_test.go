@@ -760,3 +760,139 @@ func buildCheckpoint(t *testing.T, key *ecdsa.PrivateKey, domain, head string,
 	}
 	return cpJSON, entsJSON, pem
 }
+
+// A grant may not outlive the authority it was made under.
+//
+// PE-02: nothing clamped a new binding's expiry to the grantor's own, so a
+// time-bounded admin could mint an UNBOUNDED copy before expiring — laundering
+// a temporary grant into a permanent one.
+func TestGrantCannotOutliveTheGrantorsAuthority(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		// bob must exist as a principal, or every grant below is refused for
+		// that reason instead of the one under test.
+		mustPutPrincipal(t, tx, string(bob), "/people/bob", "")
+		bindPAM(t, tx, Binding{ID: "b-root", Subject: carol, Role: "domain-admin", Scope: "/"})
+		// alice is admin at /secrets, but only until 2000.
+		bindPAM(t, tx, Binding{ID: "b-alice", Subject: alice, Role: "domain-admin",
+			Scope: "/secrets", NotAfter: 2000})
+
+		// An unbounded grant is refused.
+		res := applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: alice, AtSec: 1000}, ID: "new-1",
+			Subject: bob, Role: "kv-admin", Scope: "/secrets", Grantor: alice,
+		})
+		if res.Err == nil {
+			t.Fatal("a time-bounded admin minted an unbounded binding")
+		}
+		// So is one that reaches past the grantor's own expiry.
+		res = applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: alice, AtSec: 1000}, ID: "new-2",
+			Subject: bob, Role: "kv-admin", Scope: "/secrets", Grantor: alice, NotAfter: 9999,
+		})
+		if res.Err == nil {
+			t.Fatal("a grant outlived the authority behind it")
+		}
+		// Within the horizon is fine.
+		if res := applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: alice, AtSec: 1000}, ID: "new-3",
+			Subject: bob, Role: "kv-admin", Scope: "/secrets", Grantor: alice, NotAfter: 1500,
+		}); res.Err != nil {
+			t.Fatalf("a grant inside the grantor's horizon should be allowed: %v", res.Err)
+		}
+		// And an unbounded admin may still grant without limit.
+		if res := applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: carol, AtSec: 1000}, ID: "new-4",
+			Subject: bob, Role: "kv-admin", Scope: "/secrets", Grantor: carol,
+		}); res.Err != nil {
+			t.Fatalf("an unbounded admin should grant without limit: %v", res.Err)
+		}
+	})
+}
+
+// PE-04: an admin holding its authority only through a live activation must not
+// be able to mint a STANDING binding, which would make the elevation permanent
+// and falsify "kill ends the access, nothing to sweep".
+func TestActivatedAdminCannotMakeItsElevationPermanent(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		// Only the first principal in an empty domain may be grantorless.
+		mustPutPrincipal(t, tx, string(bob), "/people/bob", "")
+		bindPAM(t, tx, Binding{ID: "b-boot", Subject: bob, Role: "domain-admin", Scope: "/"})
+		mustPutPrincipal(t, tx, string(alice), "/people/alice", bob)
+		id := bindPAM(t, tx, Binding{ID: "b-pam", Subject: alice, Role: "domain-admin",
+			Scope: "/secrets", ActivationRequired: true, MaxActivationSec: 600})
+		if res := requestAct(tx, alice, id, 1000, 600, nil, 1000); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		if ok, _ := HasAuthority(tx, alice, VerbAdmin, "/secrets", 1010); !ok {
+			t.Fatal("precondition: the activation should confer admin")
+		}
+
+		res := applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: alice, AtSec: 1010}, ID: "standing",
+			Subject: alice, Role: "kv-admin", Scope: "/secrets", Grantor: alice,
+		})
+		if res.Err == nil {
+			t.Fatal("an activated admin minted a standing binding, outliving its own window")
+		}
+		// A grant inside the window is still permitted.
+		if res := applyPutBinding(tx, &op.PutBinding{
+			Header: op.Header{Actor: alice, AtSec: 1010}, ID: "inside",
+			Subject: bob, Role: "kv-reader", Scope: "/secrets", Grantor: alice, NotAfter: 1500,
+		}); res.Err != nil {
+			t.Fatalf("a grant inside the activation window should be allowed: %v", res.Err)
+		}
+	})
+}
+
+// PE-03: a principal may not be re-homed, and creating one is authorized.
+//
+// Authority travels with the stable ID via bindings, while delegation-narrows
+// is checked against the mutable path — so moving a principal let a subtree
+// admin drag a superior into their own subtree and then pass the narrowing
+// check against it, carrying all its authority along.
+func TestPrincipalsCannotBeRehomedOrCreatedUnauthorized(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		mustPutPrincipal(t, tx, "root", "/people/root", "")
+		bindPAM(t, tx, Binding{ID: "b-root", Subject: "root", Role: "domain-admin", Scope: "/"})
+		bindPAM(t, tx, Binding{ID: "b-sub", Subject: alice, Role: "domain-admin", Scope: "/clusters/lab"})
+
+		// alice cannot drag root into her subtree.
+		res := applyPutPrincipal(tx, &op.PutPrincipal{
+			Header: op.Header{Actor: alice, AtSec: 1000},
+			ID:     "root", Path: "/clusters/lab/people/root", Type: "human", Grantor: alice,
+		})
+		if res.Err == nil {
+			t.Fatal("a subtree admin re-homed a superior principal into its own subtree")
+		}
+		if !strings.Contains(res.Err.Error(), "may not be moved") {
+			t.Fatalf("unhelpful refusal: %v", res.Err)
+		}
+
+		// Nor create one outside her scope.
+		res = applyPutPrincipal(tx, &op.PutPrincipal{
+			Header: op.Header{Actor: alice, AtSec: 1000},
+			ID:     "newguy", Path: "/people/newguy", Type: "human", Grantor: alice,
+		})
+		if res.Err == nil {
+			t.Fatal("a subtree admin created a principal outside its scope")
+		}
+
+		// Inside her scope she may.
+		if res := applyPutPrincipal(tx, &op.PutPrincipal{
+			Header: op.Header{Actor: alice, AtSec: 1000},
+			ID:     "labguy", Path: "/clusters/lab/people/labguy", Type: "human", Grantor: alice,
+		}); res.Err != nil {
+			t.Fatalf("a subtree admin should create inside its own scope: %v", res.Err)
+		}
+	})
+}
+
+func mustPutPrincipal(t *testing.T, tx *store.Tx, id, path string, grantor op.ID) {
+	t.Helper()
+	if res := applyPutPrincipal(tx, &op.PutPrincipal{
+		Header: op.Header{Actor: grantor, AtSec: 1000},
+		ID:     op.ID(id), Path: path, Type: "human", Grantor: grantor,
+	}); res.Err != nil {
+		t.Fatal(res.Err)
+	}
+}

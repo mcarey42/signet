@@ -116,6 +116,9 @@ type PutPrincipal struct {
 	ID   ID     `json:"id"`
 	Path string `json:"path"`
 	Type string `json:"type"` // human|service|machine|workload|group|domain
+	// Grantor is who is creating this principal. Empty is legal only during
+	// bootstrap of an empty domain, exactly as for a binding.
+	Grantor ID `json:"grantor,omitempty"`
 }
 
 type PutBinding struct {

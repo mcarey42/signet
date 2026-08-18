@@ -133,9 +133,9 @@ func TestDelegationOnlyNarrows(t *testing.T) {
 	root := bootstrap(t, s)
 
 	const delegated = "/clusters/lab"
-	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "labadmin", Path: "/people/labadmin", Type: "human"})
+	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "labadmin", Path: "/people/labadmin", Type: "human", Grantor: "root"})
 	mustApply(t, s, 4, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-lab", Subject: "labadmin", Role: "domain-admin", Scope: delegated, Grantor: root})
-	mustApply(t, s, 5, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "victim", Path: "/people/victim", Type: "human"})
+	mustApply(t, s, 5, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "victim", Path: "/people/victim", Type: "human", Grantor: "root"})
 
 	segs := []string{"clusters", "lab", "lab-2", "svc", "apps", "secrets", "people", "a", "b"}
 	rng := rand.New(rand.NewSource(20260816))
@@ -189,10 +189,10 @@ func TestMappingRulesObeyDelegationNarrows(t *testing.T) {
 		JWKS: []byte(`{"keys":[{"kty":"RSA","kid":"k","n":"AQAB","e":"AQAB"}]}`), Grantor: root,
 	})
 	// A delegated admin, and two principals: one inside their subtree, one not.
-	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "labadmin", Path: "/people/labadmin", Type: "human"})
+	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "labadmin", Path: "/people/labadmin", Type: "human", Grantor: "root"})
 	mustApply(t, s, 5, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-lab", Subject: "labadmin", Role: "domain-admin", Scope: "/clusters/lab", Grantor: root})
-	mustApply(t, s, 6, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "inside", Path: "/clusters/lab/apps/runner", Type: "workload"})
-	mustApply(t, s, 7, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "outside", Path: "/clusters/prod/apps/billing", Type: "workload"})
+	mustApply(t, s, 6, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "inside", Path: "/clusters/lab/apps/runner", Type: "workload", Grantor: "root"})
+	mustApply(t, s, 7, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "outside", Path: "/clusters/prod/apps/billing", Type: "workload", Grantor: "root"})
 
 	inScope := &op.PutMapping{
 		Header: op.Header{Actor: "labadmin", AtSec: 1000}, ID: "m1", Name: "lab-runner",
@@ -234,7 +234,7 @@ func TestMappingRequiresExplicitMatchers(t *testing.T) {
 		Verifier: "k8s-sa", URL: "https://k8s.example", Audience: "signet",
 		JWKS: []byte(`{"keys":[]}`), Grantor: root,
 	})
-	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "wl", Path: "/apps/wl", Type: "workload"})
+	mustApply(t, s, 4, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "wl", Path: "/apps/wl", Type: "workload", Grantor: "root"})
 
 	if res := apply(t, s, 5, &op.PutMapping{
 		Header: op.Header{Actor: root, AtSec: 1000}, ID: "m", Name: "wide",
@@ -261,7 +261,7 @@ func TestBootstrapIsSingleUse(t *testing.T) {
 	s := newStore(t, newSeal(t))
 	bootstrap(t, s)
 
-	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "attacker", Path: "/people/attacker", Type: "human"})
+	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "attacker", Path: "/people/attacker", Type: "human", Grantor: "root"})
 	res := apply(t, s, 4, &op.PutBinding{
 		Header: op.Header{AtSec: 1000}, ID: "b-evil",
 		Subject: "attacker", Role: "domain-admin", Scope: "/", // no grantor
@@ -336,7 +336,7 @@ func TestSecretVersioningAndCAS(t *testing.T) {
 func TestHasAuthority(t *testing.T) {
 	s := newStore(t, newSeal(t))
 	root := bootstrap(t, s)
-	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "reader", Path: "/people/reader", Type: "service"})
+	mustApply(t, s, 3, &op.PutPrincipal{Header: op.Header{AtSec: 1000}, ID: "reader", Path: "/people/reader", Type: "service", Grantor: "root"})
 	mustApply(t, s, 4, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-r", Subject: "reader", Role: "kv-reader", Scope: "/secrets/lab", Grantor: root})
 	mustApply(t, s, 5, &op.PutBinding{Header: op.Header{Actor: root, AtSec: 1000}, ID: "b-jit", Subject: "reader", Role: "kv-writer", Scope: "/secrets/jit", Grantor: root, NotAfter: 2000})
 

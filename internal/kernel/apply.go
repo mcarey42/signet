@@ -92,6 +92,48 @@ func applyPutPrincipal(tx *store.Tx, o *op.PutPrincipal) op.Result {
 		return op.Result{Err: fmt.Errorf("principal: path %s already names %s", o.Path, raw)}
 	}
 
+	// An existing principal may not be MOVED.
+	//
+	// Authority travels with the stable ID, via bindings that neither move with
+	// the path nor are bounded by it — while delegation-narrows is enforced
+	// against the mutable path. Re-homing therefore let a subtree admin drag a
+	// superior principal into their own subtree and then pass the narrowing
+	// check against it, carrying all of that principal's authority along. The
+	// two halves of the model disagreed, and the rename was the seam.
+	existing, hadPrincipal, err := loadPrincipal(tx, o.ID)
+	if err != nil {
+		return op.Result{Err: err}
+	}
+	if hadPrincipal && existing.Path != o.Path {
+		return op.Result{Err: fmt.Errorf(
+			"principal: %s already exists at %s and may not be moved to %s. Bindings follow the "+
+				"stable ID while delegation is checked against the path, so moving a principal "+
+				"would carry its authority somewhere it was never granted",
+			o.ID, existing.Path, o.Path)}
+	}
+
+	// Creating or amending a principal is an administrative act at its path.
+	// This had NO check at all, which made it an unauthenticated rename.
+	if o.Grantor == "" {
+		empty, err := principalsEmpty(tx)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if !empty {
+			return op.Result{Err: errors.New(
+				"principal: missing grantor (bootstrap is only legal in an empty domain)")}
+		}
+	} else {
+		ok, err := HasAuthority(tx, o.Grantor, VerbAdmin, o.Path, o.AtSec)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if !ok {
+			return op.Result{Err: fmt.Errorf(
+				"principal: %s lacks admin authority at %s", o.Grantor, o.Path)}
+		}
+	}
+
 	p := Principal{ID: o.ID, Path: o.Path, Type: o.Type}
 	blob, err := json.Marshal(p)
 	if err != nil {
@@ -104,6 +146,58 @@ func applyPutPrincipal(tx *store.Tx, o *op.PutPrincipal) op.Result {
 		return op.Result{Err: err}
 	}
 	return op.Result{ID: o.ID}
+}
+
+// grantorHorizon is the latest moment the grantor still holds admin authority
+// covering scope. Zero means unbounded — a standing grant with no activation
+// behind it.
+//
+// The horizon is the MOST GENEROUS of the grantor's covering bindings, since
+// rights are additive: holding one unbounded admin binding means the grantor
+// genuinely may grant without limit, whatever else it also holds.
+func grantorHorizon(tx *store.Tx, grantor op.ID, scope string, nowSec int64) (int64, error) {
+	bs, err := LoadBindings(tx, grantor)
+	if err != nil {
+		return 0, err
+	}
+	var acts []Activation
+	var haveActs bool
+	var best int64 = -1
+	for _, b := range bs {
+		if !ScopeCovers(b.Scope, scope) || !roleGrants(b.Role, VerbAdmin) {
+			continue
+		}
+		if b.NotAfter != 0 && nowSec >= b.NotAfter {
+			continue
+		}
+		end := b.NotAfter
+		if b.ActivationRequired {
+			if !haveActs {
+				if acts, err = LoadActivations(tx, grantor); err != nil {
+					return 0, err
+				}
+				haveActs = true
+			}
+			live := activationFor(acts, b.ID, nowSec)
+			if live == nil {
+				continue // eligible, not holding: confers nothing to delegate
+			}
+			// Bounded by the window, and by the eligibility beneath it.
+			if end == 0 || live.Expiry < end {
+				end = live.Expiry
+			}
+		}
+		if end == 0 {
+			return 0, nil // unbounded authority: no horizon to impose
+		}
+		if end > best {
+			best = end
+		}
+	}
+	if best < 0 {
+		return 0, nil // no covering authority; the check above already refused
+	}
+	return best, nil
 }
 
 func applyPutBinding(tx *store.Tx, o *op.PutBinding) op.Result {
@@ -143,6 +237,25 @@ func applyPutBinding(tx *store.Tx, o *op.PutBinding) op.Result {
 		}
 		if !ok {
 			return op.Result{Err: fmt.Errorf("binding: grantor %s lacks admin authority at %s", o.Grantor, o.Scope)}
+		}
+		// Delegation narrows in TIME as well as in scope.
+		//
+		// Nothing clamped a grant to the grantor's own horizon, so a
+		// time-bounded admin could mint an unbounded copy before expiring, and
+		// an admin holding its authority only through a live PAM activation
+		// could mint a STANDING binding for itself — making the elevation
+		// permanent and falsifying "kill ends the access, nothing to sweep".
+		//
+		// A grant cannot outlive the authority it was made under.
+		horizon, err := grantorHorizon(tx, o.Grantor, o.Scope, o.AtSec)
+		if err != nil {
+			return op.Result{Err: err}
+		}
+		if horizon != 0 && (o.NotAfter == 0 || o.NotAfter > horizon) {
+			return op.Result{Err: fmt.Errorf(
+				"binding: %s may grant at %s only until %d, which is when its own authority there "+
+					"ends. A grant that outlives the authority behind it would survive the very "+
+					"expiry or activation-kill that was supposed to end it", o.Grantor, o.Scope, horizon)}
 		}
 	}
 
@@ -336,6 +449,15 @@ func loadPrincipal(tx *store.Tx, id op.ID) (Principal, bool, error) {
 		return p, ok, err
 	}
 	return p, true, json.Unmarshal(raw, &p)
+}
+
+func principalsEmpty(tx *store.Tx) (bool, error) {
+	empty := true
+	err := tx.ScanPrefix(store.BucketPrincipals, "", func(string, []byte) bool {
+		empty = false
+		return false
+	})
+	return empty, err
 }
 
 func bindingsEmpty(tx *store.Tx) (bool, error) {
