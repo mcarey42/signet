@@ -24,6 +24,8 @@ var opAAD = []byte("signet/op/v1")
 type FSM struct {
 	st      *store.Store
 	applied atomic.Uint64
+	// halted records that a committed entry could not be applied. See Apply.
+	halted atomic.Pointer[error]
 }
 
 // New reads the applied-index watermark and FAILS CLOSED if it cannot.
@@ -75,7 +77,30 @@ var ErrAlreadyApplied = errors.New(
 		"The log is behind the state it describes — usually a lost or restored raft.db beside a " +
 		"surviving state.db. Do not treat this as success; restore the pair together")
 
+// Halted reports why this FSM stopped applying, or nil.
+func (f *FSM) Halted() error {
+	if p := f.halted.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
 func (f *FSM) Apply(l *raft.Log) any {
+	// Once halted, nothing further is applied.
+	//
+	// Raft does not retry a failed Apply; it moves on. So a store failure that
+	// merely returned an error let the NEXT entry apply and advance the
+	// watermark past the one that failed — permanently losing a committed
+	// change while the log still says it happened, with the node serving
+	// happily on state that no longer matches its own history.
+	//
+	// A deterministic replica that cannot apply a committed entry has nowhere
+	// safe to go: everything after it is computed from state that is missing a
+	// change. So it stops, loudly, and a restart replays from the watermark —
+	// which was never advanced — and applies the entry properly.
+	if err := f.Halted(); err != nil {
+		return op.Result{Err: err}
+	}
 	if l.Index <= f.applied.Load() {
 		return op.Result{Err: ErrAlreadyApplied}
 	}
@@ -104,7 +129,18 @@ func (f *FSM) Apply(l *raft.Log) any {
 		}
 		return tx.SetAppliedIndex(l.Index)
 	}); err != nil {
-		return op.Result{Err: fmt.Errorf("fsm: apply entry %d: %w", l.Index, err)}
+		// Not a rejected operation — kernel.Apply records those inside the
+		// transaction and commits. This is the STORE failing: out of disk, I/O
+		// error, a refused write. The entry is committed to the log and has not
+		// taken effect, and it is not safe to continue without it.
+		halt := fmt.Errorf(
+			"fsm: HALTED at log entry %d: this committed entry could not be written to the store "+
+				"(%w). It is not lost — the applied-index watermark was not advanced, so restarting "+
+				"replays and applies it. Nothing further will be applied until then, because "+
+				"continuing would compute later state from state that is missing a committed "+
+				"change. Fix the underlying cause (usually disk) and restart", l.Index, err)
+		f.halted.CompareAndSwap(nil, &halt)
+		return op.Result{Err: halt}
 	}
 	f.applied.Store(l.Index)
 	return res

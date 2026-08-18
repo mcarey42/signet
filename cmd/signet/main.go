@@ -637,7 +637,9 @@ func cmdServe(args []string) error {
 		Domain:     *domain,
 		Status: func() vaultkv.Status {
 			s := node.Status()
-			return vaultkv.Status{Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader}
+			return vaultkv.Status{
+				Initialized: s.Initialized, Sealed: s.Sealed, Leader: s.Leader, Halted: s.Halted,
+			}
 		},
 	})
 	oidcIssuer := *issuerURL

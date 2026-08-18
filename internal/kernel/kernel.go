@@ -40,6 +40,8 @@ type Kernel struct {
 	verifiers *attest.Registry
 	seal      seal.Seal
 	now       func() time.Time
+	// cp caches the signed audit checkpoint. See kernel/audit.go.
+	cp checkpointCache
 }
 
 // New builds a kernel. The seal is what opens sealed private key material; a

@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mcarey42/signet/internal/audit"
@@ -67,7 +68,50 @@ func (k *Kernel) AuditEntries(ctx context.Context, after, upTo uint64) ([]store.
 // just re-derived would let a corrupted store launder itself into a statement
 // that looks authoritative — the signature would be perfectly valid and the
 // claim false.
+// checkpointCache holds the last signed checkpoint and the chain state it
+// describes.
+//
+// Checkpoint re-verifies the ENTIRE audit chain and then signs, and the
+// endpoint serving it is unauthenticated by design — a checkpoint is a public
+// claim, and requiring a credential to read one would invert the bootstrap for
+// witnessing. That made it an unauthenticated O(N) lever: measured at 46× cost
+// growth over 3,000 entries, growing linearly and forever, since the chain is
+// never pruned.
+//
+// A checkpoint is a statement about a chain state, so while that state is
+// unchanged the same statement remains true and re-deriving it is pure waste.
+// The cache is refreshed when the chain grows, or after maxCheckpointAge so the
+// timestamp does not drift arbitrarily far behind.
+type checkpointCache struct {
+	mu     sync.Mutex
+	signed *audit.Signed
+	count  uint64
+	head   string
+	atSec  int64
+}
+
+const maxCheckpointAge = 60 // seconds
+
 func (k *Kernel) Checkpoint(ctx context.Context, domain, node string) (*audit.Signed, error) {
+	// Cheap first: the chain length is one read, where verifying it is a walk.
+	// If nothing has been appended since the cached checkpoint, that checkpoint
+	// is still exactly true.
+	var claimed uint64
+	if err := k.store.View(func(tx *store.Tx) error {
+		var e error
+		claimed, e = tx.AuditCount()
+		return e
+	}); err != nil {
+		return nil, err
+	}
+	k.cp.mu.Lock()
+	if c := k.cp.signed; c != nil && k.cp.count == claimed &&
+		k.now().Unix()-k.cp.atSec < maxCheckpointAge {
+		defer k.cp.mu.Unlock()
+		return c, nil
+	}
+	k.cp.mu.Unlock()
+
 	count, head, err := k.VerifyAudit(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("refusing to checkpoint a chain that does not verify: %w", err)
@@ -87,10 +131,18 @@ func (k *Kernel) Checkpoint(ctx context.Context, domain, node string) (*audit.Si
 	if err != nil {
 		return nil, err
 	}
-	return audit.Sign(&audit.Checkpoint{
+	now := k.now().Unix()
+	signed, err := audit.Sign(&audit.Checkpoint{
 		Domain: domain, Node: node, Count: count, Head: head,
-		Index: applied, AtSec: k.now().Unix(),
+		Index: applied, AtSec: now,
 	}, key.ID, signer)
+	if err != nil {
+		return nil, err
+	}
+	k.cp.mu.Lock()
+	k.cp.signed, k.cp.count, k.cp.head, k.cp.atSec = signed, count, head, now
+	k.cp.mu.Unlock()
+	return signed, nil
 }
 
 // AuditPublicKey returns the public half of the checkpoint signing key, which a

@@ -37,6 +37,9 @@ type Status struct {
 	Initialized bool
 	Sealed      bool
 	Leader      bool
+	// Halted is non-empty when the node could not apply a committed entry and
+	// has stopped rather than diverge from its own log.
+	Halted string
 }
 
 type Config struct {
@@ -437,12 +440,24 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	}
 	// cert-manager branches on the status code alone, but this homelab's
 	// monitoring asserts on the body's booleans — so both are contractual.
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"initialized": st.Initialized,
 		"sealed":      st.Sealed,
 		"standby":     !st.Leader,
 		"version":     "signet-0.1.0-mvp",
-	})
+	}
+	code := http.StatusOK
+	if st.Halted != "" {
+		// A halted node's state no longer matches its own log. Reporting 200
+		// keeps every consumer pointed at a node that cannot answer correctly,
+		// which is worse than being visibly down — so this is the one case
+		// where health deliberately fails the status-code check that
+		// cert-manager and friends rely on.
+		code = http.StatusServiceUnavailable
+		body["halted"] = st.Halted
+		body["sealed"] = true // "do not use me" in the vocabulary clients already speak
+	}
+	writeJSON(w, code, body)
 }
 
 func (h *Handler) mountPreflight(w http.ResponseWriter, r *http.Request) {

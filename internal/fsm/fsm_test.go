@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,5 +224,67 @@ func TestSkippedEntryIsNotReportedAsSuccess(t *testing.T) {
 	}
 	if !errors.Is(res.Err, fsm.ErrAlreadyApplied) {
 		t.Fatalf("expected ErrAlreadyApplied, got: %v", res.Err)
+	}
+}
+
+// A committed entry that cannot be written must HALT the node, not be skipped.
+//
+// Raft does not retry a failed Apply; it moves on. So a store failure that
+// merely returned an error let the NEXT entry apply and advance the watermark
+// past the one that failed — permanently losing a committed change while the
+// log still said it happened, with the node serving on state that no longer
+// matched its own history. Restart-first gave the other outcome: a write
+// reported as failed materialising later.
+//
+// A deterministic replica missing a committed change has nowhere safe to go.
+func TestApplyFailureHaltsRatherThanSkips(t *testing.T) {
+	dir := t.TempDir()
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 21)
+	}
+	s, err := store.Open(filepath.Join(dir, "state.db"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	machine, err := fsm.New(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if machine.Halted() != nil {
+		t.Fatal("a healthy FSM should not start halted")
+	}
+
+	// Break the store underneath it, the way a disk failure would.
+	s.Close()
+
+	// A VALID entry, so the failure lands in the store rather than in decoding —
+	// a malformed entry is a data problem and correctly does NOT halt.
+	raw, err := op.Encode(&op.PutPrincipal{
+		Header: op.Header{AtSec: 1000}, ID: "p1", Path: "/people/p1", Type: "human",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := s.Barrier().SealRandom(raw, []byte("signet/op/v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, _ := machine.Apply(&raft.Log{Index: 1, Term: 1, Data: sealed}).(op.Result)
+	if res.Err == nil {
+		t.Fatal("applying to a broken store reported success")
+	}
+	if machine.Halted() == nil {
+		t.Fatal("the FSM kept going after failing to apply a committed entry")
+	}
+
+	// And it refuses everything afterwards, so a later entry cannot advance the
+	// watermark past the one that was lost.
+	next, _ := machine.Apply(&raft.Log{Index: 2, Term: 1, Data: sealed}).(op.Result)
+	if next.Err == nil {
+		t.Fatal("a halted FSM applied a subsequent entry")
+	}
+	if !strings.Contains(next.Err.Error(), "HALTED") {
+		t.Fatalf("the refusal should name the halt: %v", next.Err)
 	}
 }

@@ -31,6 +31,7 @@ type Node struct {
 	trans *raft.InmemTransport
 	id    string
 	seal  seal.Seal
+	fsm   *FSM
 }
 
 type Config struct {
@@ -149,7 +150,7 @@ func Open(cfg Config) (*Node, error) {
 			return nil, fmt.Errorf("fsm: bootstrap: %w", err)
 		}
 	}
-	return &Node{raft: r, st: st, logs: logs, trans: trans, id: cfg.NodeID, seal: sl}, nil
+	return &Node{raft: r, st: st, logs: logs, trans: trans, id: cfg.NodeID, seal: sl, fsm: machine}, nil
 }
 
 func (n *Node) Store() *store.Store { return n.st }
@@ -188,6 +189,12 @@ func (n *Node) WaitForLeader(ctx context.Context) error {
 // computed. The barrier pass happens here, at propose time, so the Raft log and
 // every backup segment built from it hold ciphertext only (docs/03).
 func (n *Node) Propose(ctx context.Context, o op.Op) (op.Result, error) {
+	// Refuse rather than append to a log this node cannot apply. The entry
+	// would commit and then sit unapplied, which is how the original bug
+	// reported failure for a write that later materialised.
+	if err := n.fsm.Halted(); err != nil {
+		return op.Result{}, err
+	}
 	raw, err := op.Encode(o)
 	if err != nil {
 		return op.Result{}, err
@@ -226,10 +233,13 @@ type Status struct {
 	NodeID      string
 	SealName    string
 	SealKeyID   string
+	// Halted is non-empty when a committed entry could not be applied. The node
+	// is running but must not be trusted to answer.
+	Halted string
 }
 
 func (n *Node) Status() Status {
-	return Status{
+	st := Status{
 		Initialized: true,
 		Sealed:      false, // Signet unseals at startup or refuses to start
 		Leader:      n.raft.State() == raft.Leader,
@@ -237,6 +247,13 @@ func (n *Node) Status() Status {
 		SealName:    n.seal.Name(),
 		SealKeyID:   n.seal.KeyID(),
 	}
+	// A halted FSM has state that no longer matches its own log. Reporting
+	// healthy would keep every consumer pointed at a node that cannot answer
+	// correctly, which is worse than being visibly down.
+	if err := n.fsm.Halted(); err != nil {
+		st.Halted = err.Error()
+	}
+	return st
 }
 
 func (n *Node) Close() error {
