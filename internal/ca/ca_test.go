@@ -274,3 +274,41 @@ func TestSubdomainAndBareDomainRules(t *testing.T) {
 		t.Error("case or trailing dot changed the answer")
 	}
 }
+
+// A URI prefix must match at a structural boundary, not as a raw string.
+//
+// uriAllowed was a bare strings.HasPrefix, so a role permitting
+// spiffe://home.example also permitted spiffe://home.example.evil/... — the
+// attacker picks a host that merely starts with yours. URI name constraints are
+// deliberately never emitted (E-02), so this predicate is the ONLY control over
+// which SPIFFE identities a role can issue.
+func TestURIPrefixMatchesAtABoundary(t *testing.T) {
+	role := Role{AllowedURIPrefix: []string{
+		"spiffe://home.example.net",
+		"spiffe://apps.example.net/team-a",
+	}}
+
+	for _, tc := range []struct {
+		uri  string
+		want bool
+		why  string
+	}{
+		{"spiffe://home.example.net/workload/api", true, "inside the delegated domain"},
+		{"spiffe://home.example.net", true, "the domain itself"},
+		{"spiffe://HOME.EXAMPLE.NET/x", true, "hosts are case-insensitive"},
+		{"spiffe://apps.example.net/team-a", true, "exactly the delegated path"},
+		{"spiffe://apps.example.net/team-a/svc", true, "beneath the delegated path"},
+
+		{"spiffe://home.example.net.evil/x", false, "a longer host that merely starts the same"},
+		{"spiffe://home.example.nety/x", false, "one extra character in the host"},
+		{"spiffe://apps.example.net/team-attacker", false, "a longer path segment, not a child"},
+		{"spiffe://evil.net/x", false, "a different host entirely"},
+		{"https://home.example.net/x", false, "a different scheme"},
+		{"spiffe://user@home.example.net/x", false, "userinfo is not interpreted"},
+		{"spiffe://home.example.net:8443/x", false, "a port is a different authority"},
+	} {
+		if got := uriAllowed(role, tc.uri); got != tc.want {
+			t.Errorf("uriAllowed(%q) = %v, want %v — %s", tc.uri, got, tc.want, tc.why)
+		}
+	}
+}

@@ -28,6 +28,9 @@ type DomainState struct {
 	// own replacement would make pinning meaningless (E-01 FED-3).
 	PinnedSPKI string `json:"pinned_spki"`
 	LastEpoch  uint64 `json:"last_epoch"`
+	// LastDigest is the exact bundle accepted at LastEpoch, so republishing
+	// different content under the same epoch number is detectable.
+	LastDigest string `json:"last_digest,omitempty"`
 	UpdatedAt  int64  `json:"updated_at"`
 	// Bundle is the domain's last accepted bundle, kept verbatim so it can be
 	// re-verified rather than re-fetched. A consumer that federates with

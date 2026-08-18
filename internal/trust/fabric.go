@@ -284,7 +284,8 @@ func verifyStored(ds DomainState, domain string, now time.Time) (*Payload, error
 		return nil, err
 	}
 	p, err := Verify(&b, VerifyOptions{
-		PinnedSPKI: ds.PinnedSPKI, Domain: domain, LastEpoch: ds.LastEpoch,
+		PinnedSPKI: ds.PinnedSPKI, Domain: domain,
+		LastEpoch: ds.LastEpoch, LastDigest: ds.LastDigest,
 		Now: now, Skew: 5 * time.Minute,
 	})
 	if err != nil {
@@ -310,7 +311,8 @@ func (s *State) Peer(pin string, raw []byte, now time.Time) (*Payload, error) {
 	}
 	cur := s.Domains[peek.Domain]
 	p, err := Verify(&b, VerifyOptions{
-		PinnedSPKI: pin, Domain: peek.Domain, LastEpoch: cur.LastEpoch,
+		PinnedSPKI: pin, Domain: peek.Domain,
+		LastEpoch: cur.LastEpoch, LastDigest: cur.LastDigest,
 		Now: now, Skew: 5 * time.Minute,
 	})
 	if err != nil {
@@ -321,7 +323,7 @@ func (s *State) Peer(pin string, raw []byte, now time.Time) (*Payload, error) {
 	}
 	st := s.Domains[p.Domain]
 	st.Bundle = append([]byte(nil), raw...)
-	st.LastEpoch, st.UpdatedAt = p.Epoch, now.Unix()
+	st.LastEpoch, st.LastDigest, st.UpdatedAt = p.Epoch, DigestOf(&b), now.Unix()
 	s.Domains[p.Domain] = st
 	return p, nil
 }

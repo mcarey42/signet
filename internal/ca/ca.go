@@ -505,13 +505,58 @@ func domainAllowed(role Role, name string) bool {
 	return false
 }
 
+// uriAllowed checks a URI SAN against a role's permitted prefixes, matching at
+// a STRUCTURAL boundary rather than by raw string prefix.
+//
+// A bare HasPrefix made `spiffe://home.example` also permit
+// `spiffe://home.example.evil/anything`, because "home.example.evil" starts
+// with "home.example". Since URI name constraints are deliberately never
+// emitted into certificates (E-02: verifiers disagree about them), this
+// predicate is the ONLY control over what SPIFFE identities a role can issue —
+// so a string-prefix bug here is the whole boundary.
+//
+// A prefix matches when the URI is identical to it, or continues it at a
+// separator: '/' within the path, or the end of the authority. Comparison is
+// case-insensitive on scheme and host, as URIs are, and case-sensitive on the
+// path, as they also are.
 func uriAllowed(role Role, uri string) bool {
 	for _, p := range role.AllowedURIPrefix {
-		if strings.HasPrefix(uri, p) {
+		if uriPrefixMatches(p, uri) {
 			return true
 		}
 	}
 	return false
+}
+
+func uriPrefixMatches(prefix, uri string) bool {
+	if prefix == "" {
+		return false
+	}
+	pu, err := url.Parse(prefix)
+	if err != nil {
+		return false
+	}
+	cu, err := url.Parse(uri)
+	if err != nil {
+		return false
+	}
+	// Scheme and authority must match exactly — this is where the old bug lived,
+	// since a longer host trivially "starts with" a shorter one.
+	if !strings.EqualFold(pu.Scheme, cu.Scheme) || !strings.EqualFold(pu.Host, cu.Host) {
+		return false
+	}
+	if pu.User != nil || cu.User != nil {
+		return false // userinfo in a workload identity is not something to interpret
+	}
+	pp, cp := pu.EscapedPath(), cu.EscapedPath()
+	switch {
+	case pp == "" || pp == "/":
+		return true // the whole trust domain was delegated
+	case cp == pp:
+		return true
+	default:
+		return strings.HasPrefix(cp, strings.TrimSuffix(pp, "/")+"/")
+	}
 }
 
 func looksLikeDNS(s string) bool {

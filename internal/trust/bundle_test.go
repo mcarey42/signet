@@ -497,3 +497,61 @@ func TestRevocationIsKeyedOnTheActualKey(t *testing.T) {
 		t.Fatal("a revoked issuer was usable because its published entry misreported its fingerprint")
 	}
 }
+
+// Only the ROOT anchor may sign a bundle.
+//
+// Verify accepted any anchor, so a consumer pinned to an ISSUER would accept a
+// bundle that issuer signed. An issuing key is authorized to mint leaves inside
+// a namespace, not to declare the trust set — that is the invariant this whole
+// package rests on, and accepting an issuer-signed bundle let one compromised
+// node redefine trust for everyone pinned to it.
+func TestOnlyTheRootAnchorMaySignABundle(t *testing.T) {
+	root := mkCA(t, "example root", nil)
+	issuer := mkCA(t, "issuer a", root)
+
+	// A bundle signed by the ISSUER, with the issuer present as an anchor.
+	p, err := Build("home.example.net", 1, time.Hour,
+		[]Anchor{anchorOf(root, RoleRoot), anchorOf(issuer, RoleIssuer)},
+		[]Issuer{issuerOf(issuer)}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Sign(p, issuer.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A consumer pinned to that issuer must still refuse it.
+	_, err = Verify(b, VerifyOptions{PinnedSPKI: Fingerprint(issuer.cert), Now: time.Now()})
+	wantErr(t, err, "not signed by the pinned key")
+}
+
+// One epoch must mean one trust set. A non-strict rollback check let two
+// DIFFERENT bundles share an epoch, so a withdrawal could be undone by
+// republishing the pre-withdrawal content under its original number.
+func TestSameEpochWithDifferentContentIsRefused(t *testing.T) {
+	root := mkCA(t, "example root", nil)
+	a := mkCA(t, "issuer a", root)
+	b := mkCA(t, "issuer b", root)
+	pin := Fingerprint(root.cert)
+
+	withB := mkBundle(t, root, 5, time.Hour, a, b) // before the withdrawal
+	withoutB := mkBundle(t, root, 5, time.Hour, a) // same epoch, b withdrawn
+
+	accepted := mustVerify(t, withoutB, VerifyOptions{PinnedSPKI: pin, Now: time.Now()})
+	if accepted.Epoch != 5 {
+		t.Fatal("precondition")
+	}
+	digest := DigestOf(withoutB)
+
+	// Re-presenting the SAME bundle at that epoch is fine — refresh must work.
+	if _, err := Verify(withoutB, VerifyOptions{
+		PinnedSPKI: pin, LastEpoch: 5, LastDigest: digest, Now: time.Now()}); err != nil {
+		t.Fatalf("re-accepting the identical bundle should be allowed: %v", err)
+	}
+
+	// Different content under the same number is not.
+	_, err := Verify(withB, VerifyOptions{
+		PinnedSPKI: pin, LastEpoch: 5, LastDigest: digest, Now: time.Now()})
+	wantErr(t, err, "cannot share an epoch")
+}

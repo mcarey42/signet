@@ -193,9 +193,12 @@ type VerifyOptions struct {
 	// different one is refused rather than merged: merging trust domains lets
 	// one forge identities belonging to another (SPIFFE Federation §4.2).
 	Domain string
-	// LastEpoch is the highest epoch this consumer has already accepted.
-	LastEpoch uint64
-	Now       time.Time
+	// LastEpoch is the highest epoch this consumer has already accepted, and
+	// LastDigest the exact bytes it accepted there. Together they make an epoch
+	// mean one specific trust set rather than merely a number.
+	LastEpoch  uint64
+	LastDigest string
+	Now        time.Time
 	// Skew tolerates disagreement between this clock and the publisher's when
 	// judging whether a timestamp is in the future.
 	//
@@ -251,6 +254,15 @@ func Verify(b *Bundle, opts VerifyOptions) (*Payload, error) {
 	var signed, foundPinnedAnchor bool
 	digest := sha256.Sum256(raw)
 	for i := range p.Anchors {
+		// Only the ROOT anchor may sign. This once accepted any anchor, so a
+		// consumer pinned to an ISSUER would accept a bundle that issuer signed
+		// — and an issuing key is authorized to mint leaves in a namespace, not
+		// to declare the trust set. That is the invariant this whole package is
+		// built on (see the package comment); accepting an issuer-signed bundle
+		// let one compromised node redefine trust for everyone pinned to it.
+		if p.Anchors[i].Role != RoleRoot {
+			continue
+		}
 		cert, err := parseCert(p.Anchors[i].CertPEM)
 		if err != nil {
 			continue
@@ -296,11 +308,26 @@ func Verify(b *Bundle, opts VerifyOptions) (*Payload, error) {
 
 	// 3. Rollback. An older bundle is a valid signed artifact forever, so the
 	// only defence against replaying one is refusing to go backwards.
+	// Strictly greater, unless it is byte-identical to what we already hold.
+	//
+	// A non-strict check let two DIFFERENT bundles at the SAME epoch be
+	// interchangeable, so a withdrawal could be undone simply by republishing
+	// the pre-withdrawal content under its original epoch number. The epoch is
+	// the anti-rollback counter; equal epochs must mean equal bundles.
 	if p.Epoch < opts.LastEpoch {
 		return nil, fmt.Errorf(
 			"trust: this bundle is epoch %d but epoch %d has already been accepted. Refusing to "+
 				"move backwards — an older bundle may describe a trust set that has since been "+
 				"narrowed, and serving one is how a revocation gets suppressed", p.Epoch, opts.LastEpoch)
+	}
+	if p.Epoch == opts.LastEpoch && opts.LastDigest != "" {
+		if got := digestOf(raw); got != opts.LastDigest {
+			return nil, fmt.Errorf(
+				"trust: this bundle claims epoch %d, which has already been accepted, but its "+
+					"contents differ from the one accepted at that epoch. Two different trust sets "+
+					"cannot share an epoch — publish a new one rather than reissuing an old number",
+				p.Epoch)
+		}
 	}
 
 	// 4. Freshness, fail-closed.
@@ -382,6 +409,21 @@ func (p *Payload) Pool(anchor *Anchor) (roots *x509.CertPool, intermediates *x50
 		intermediates.AddCert(c)
 	}
 	return roots, intermediates, nil
+}
+
+// DigestOf is the identity of a bundle's signed bytes, used to pin an epoch to
+// one specific trust set.
+func DigestOf(b *Bundle) string {
+	raw, err := base64.StdEncoding.DecodeString(b.Payload)
+	if err != nil {
+		return ""
+	}
+	return digestOf(raw)
+}
+
+func digestOf(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return "sha256:" + base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // PayloadOf decodes a bundle's payload WITHOUT verifying it.
