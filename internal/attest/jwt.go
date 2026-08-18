@@ -51,11 +51,34 @@ func ParseJWKS(raw []byte) (*JWKS, error) {
 	if len(s.Keys) == 0 {
 		return nil, errors.New("jwks: no keys")
 	}
+
+	// Keep the keys we can use and drop the ones we cannot, rather than
+	// rejecting the whole set because of one.
+	//
+	// This runs on every login (k8ssa.go). Failing the set closed meant that a
+	// Kubernetes cluster adding a single key of a type we do not implement —
+	// an Ed25519 "OKP" key, say — would take down authentication for that
+	// entire issuer, for a key nobody was going to use. RFC 7517 §5 is explicit
+	// that a consumer should ignore keys it cannot process; a key set is a
+	// bag of offers, not a contract.
+	//
+	// Dropping a key is not silently permissive: a token whose `kid` names a
+	// dropped key simply finds no key and fails, which is the correct and
+	// narrow outcome. Only if NOTHING is usable is this an error, and then the
+	// reasons are reported together so the operator sees the real cause.
+	usable := make([]JWK, 0, len(s.Keys))
+	var why []string
 	for i, k := range s.Keys {
 		if _, err := k.publicKey(); err != nil {
-			return nil, fmt.Errorf("jwks: key %d (kid %q): %w", i, k.Kid, err)
+			why = append(why, fmt.Sprintf("key %d (kid %q): %v", i, k.Kid, err))
+			continue
 		}
+		usable = append(usable, k)
 	}
+	if len(usable) == 0 {
+		return nil, fmt.Errorf("jwks: no usable keys — %s", strings.Join(why, "; "))
+	}
+	s.Keys = usable
 	return &s, nil
 }
 

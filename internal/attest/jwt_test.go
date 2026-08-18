@@ -210,3 +210,57 @@ func TestParseJWKSRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// A key set containing a key type we do not implement must still be usable.
+//
+// Regression: ParseJWKS used to fail the entire set on the first unsupported
+// key, and it runs on every login — so one Ed25519 key appearing in a cluster's
+// JWKS would have taken down authentication for that whole issuer, over a key
+// nobody was going to use. RFC 7517 §5 says to ignore keys you cannot process.
+func TestJWKSKeepsUsableKeysAndDropsTheRest(t *testing.T) {
+	s := newSigner(t)
+	now := time.Now()
+
+	// The cluster's key set grows a key type we do not implement, and one that
+	// is simply malformed. The RSA and EC keys we DO understand are still there.
+	s.jwks.Keys = append(s.jwks.Keys,
+		JWK{Kty: "OKP", Crv: "Ed25519", Kid: "future-1",
+			X: "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},
+		JWK{Kty: "RSA", Kid: "broken-1", N: "!!!not-base64!!!", E: "AQAB"},
+	)
+	raw, _ := json.Marshal(s.jwks)
+
+	set, err := ParseJWKS(raw)
+	if err != nil {
+		t.Fatalf("a set with usable keys must parse despite unusable ones: %v", err)
+	}
+	if len(set.Keys) != 2 {
+		t.Fatalf("expected the 2 usable keys to survive, got %d: %+v", len(set.Keys), set.Keys)
+	}
+
+	// And authentication still works, which is the whole point.
+	iss := Issuer{Name: "kind", URL: testIssuer, Audience: testAud, JWKS: raw}
+	for _, alg := range []string{"RS256", "ES256"} {
+		tok := s.mint(t, alg, saClaims(now, nil))
+		if _, err := (K8sSA{}).Verify([]byte(tok), iss, now); err != nil {
+			t.Fatalf("%s should still verify after the set gained an unsupported key: %v", alg, err)
+		}
+	}
+}
+
+// If nothing in the set is usable, that IS an error — and it must say why,
+// per key, rather than reporting the first failure and stopping.
+func TestJWKSWithNothingUsableIsAnError(t *testing.T) {
+	_, err := ParseJWKS([]byte(`{"keys":[
+      {"kty":"OKP","crv":"Ed25519","kid":"a","x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},
+      {"kty":"OCT","kid":"b"}
+    ]}`))
+	if err == nil {
+		t.Fatal("a set with no usable keys must fail")
+	}
+	for _, want := range []string{"no usable keys", `"a"`, `"b"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error should mention %s, got: %v", want, err)
+		}
+	}
+}

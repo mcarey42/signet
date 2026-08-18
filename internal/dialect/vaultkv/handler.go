@@ -11,6 +11,7 @@
 package vaultkv
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -725,10 +726,32 @@ func (h *Handler) versionAction(mode op.VersionMode) http.HandlerFunc {
 			writeErr(w, http.StatusNotFound, "no handler for route")
 			return
 		}
+		// An ABSENT body means "the current version". A body that is present but
+		// unreadable must never mean that.
+		//
+		// This decode error used to be discarded, and the consequence was as bad
+		// as it gets: versionList rejects a malformed list precisely so a
+		// destructive call cannot act on the wrong thing, but discarding the
+		// error left Versions nil — and nil is the sentinel for "the current
+		// version". `{"versions":["abc"]}` on /destroy therefore destroyed the
+		// live secret and returned 204. The guard existed; throwing away its
+		// verdict disarmed it.
+		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "could not read request body")
+			return
+		}
 		var body struct {
 			Versions versionList `json:"versions"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body) // an empty body means "the current version"
+		if len(bytes.TrimSpace(raw)) > 0 {
+			if err := json.Unmarshal(raw, &body); err != nil {
+				writeErr(w, http.StatusBadRequest,
+					"malformed request body: "+err.Error()+
+						" — refusing to fall back to acting on the current version")
+				return
+			}
+		}
 		if h.writeKernelErr(w, h.k.VersionAction(r.Context(), s, path, body.Versions, mode)) {
 			return
 		}

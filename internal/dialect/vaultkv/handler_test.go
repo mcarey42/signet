@@ -277,3 +277,64 @@ func TestVersionActionAcceptsStringAndNumericVersions(t *testing.T) {
 		}
 	}
 }
+
+// A malformed version list must never be treated as "act on the current
+// version".
+//
+// Regression, and the worst bug this project has shipped: versionList exists to
+// reject a malformed list precisely so a destructive call cannot act on the
+// wrong thing. The handler then discarded its error with `_ =`, which left
+// Versions nil — and nil is the sentinel for "the current version". So
+// {"versions":["abc"]} on /destroy destroyed the live secret and returned 204.
+// The guard was there; throwing away its verdict disarmed it.
+func TestMalformedVersionListIsRefusedNotAppliedToCurrent(t *testing.T) {
+	path := "/v1/" + testMount + "/data/cluster-svc/apps/litellm"
+
+	for _, tc := range []struct {
+		name, route, body string
+	}{
+		{"destroy with a string version", "/destroy/", `{"versions":["abc"]}`},
+		{"destroy with a scalar", "/destroy/", `{"versions":1}`},
+		{"delete with a truncated body", "/delete/", `{`},
+		{"delete with a nested object", "/delete/", `{"versions":[{"v":1}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, token := newServer(t)
+
+			code, _ := do(t, srv, "GET", path, token, nil)
+			if code != 200 {
+				t.Fatalf("precondition: the secret should be readable, got %d", code)
+			}
+
+			code, body := do(t, srv, "POST",
+				"/v1/"+testMount+tc.route+"cluster-svc/apps/litellm", token, []byte(tc.body))
+			if code == 204 {
+				t.Fatalf("a malformed version list was accepted (204) — it would have acted on the current version")
+			}
+			if code != 400 {
+				t.Fatalf("expected 400 for a malformed body, got %d: %s", code, body)
+			}
+
+			// And the secret is untouched, which is the property that matters.
+			code, _ = do(t, srv, "GET", path, token, nil)
+			if code != 200 {
+				t.Fatalf("the secret was altered by a request that was refused: read now %d", code)
+			}
+		})
+	}
+}
+
+// An ABSENT body still means "the current version" — the fix must not break
+// the documented shorthand every client relies on.
+func TestAbsentBodyStillMeansCurrentVersion(t *testing.T) {
+	srv, token := newServer(t)
+	path := "/v1/" + testMount + "/data/cluster-svc/apps/litellm"
+
+	code, _ := do(t, srv, "POST", "/v1/"+testMount+"/delete/cluster-svc/apps/litellm", token, nil)
+	if code != 204 {
+		t.Fatalf("an empty body should soft-delete the current version, got %d", code)
+	}
+	if code, _ := do(t, srv, "GET", path, token, nil); code != 404 {
+		t.Fatalf("the current version should now be soft-deleted, read returned %d", code)
+	}
+}

@@ -224,12 +224,41 @@ func applyActivationAction(tx *store.Tx, o *op.ActivationAction) op.Result {
 		if a.State != ActivationActive && a.State != ActivationPending {
 			return op.Result{Err: fmt.Errorf("activation: %s is already %s", o.ID, a.State)}
 		}
+		// Giving up your own elevated access is always allowed — making that
+		// hard would only discourage people from doing it. Ending somebody
+		// else's is an administrative act at the scope in question.
+		if o.Actor2 != a.Subject {
+			ok, err := HasAuthority(tx, o.Actor2, VerbAdmin, a.Scope, o.AtSec)
+			if err != nil {
+				return op.Result{Err: err}
+			}
+			if !ok {
+				return op.Result{Err: fmt.Errorf(
+					"activation: %s cannot end another principal's activation at %s without admin "+
+						"authority there. A principal may always kill their own", o.Actor2, a.Scope)}
+			}
+		}
 		a.State, a.DecidedBy, a.DecidedAt, a.KillReason = ActivationKilled, o.Actor2, o.AtSec, o.Reason
 		return op.Result{Err: putActivation(tx, a)}
 
 	case op.ActivationDeny:
 		if a.State != ActivationPending {
 			return op.Result{Err: fmt.Errorf("activation: %s is %s, not pending", o.ID, a.State)}
+		}
+		// Refusing a request is the same authority as granting one. Without
+		// this check any authenticated principal could deny everyone else's
+		// requests — a denial of service against privileged access itself,
+		// which is precisely when people need it to work.
+		if o.Actor2 != a.Subject {
+			ok, err := HasAuthority(tx, o.Actor2, VerbAdmin, a.Scope, o.AtSec)
+			if err != nil {
+				return op.Result{Err: err}
+			}
+			if !ok {
+				return op.Result{Err: fmt.Errorf(
+					"activation: %s cannot deny a request at %s without admin authority there. "+
+						"Denying is the same authority as approving", o.Actor2, a.Scope)}
+			}
 		}
 		a.State, a.DecidedBy, a.DecidedAt, a.KillReason = ActivationDenied, o.Actor2, o.AtSec, o.Reason
 		return op.Result{Err: putActivation(tx, a)}

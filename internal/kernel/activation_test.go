@@ -416,3 +416,70 @@ func TestActivationDoesNotWidenScopeOrRole(t *testing.T) {
 		}
 	})
 }
+
+// Ending someone else's activation is an administrative act.
+//
+// Regression: kill and deny performed NO authority check at all — only approve
+// did — while the HTTP handler's comment claimed enforcement happened inside
+// Apply. Any authenticated principal could therefore end anyone's elevated
+// access, or refuse anyone's request: a denial of service against privileged
+// access, at exactly the moment it is needed.
+func TestKillAndDenyRequireAuthority(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		id := bindPAM(t, tx, Binding{ID: "b-pam", Subject: alice, Role: "kv-admin",
+			Scope: "/secrets", ActivationRequired: true})
+		// bob is authenticated but holds nothing anywhere.
+		if res := requestAct(tx, alice, id, 1000, 3600, nil, 1000); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+
+		if res := decide(tx, bob, alice, "act-1", op.ActivationKill, 1010); res.Err == nil {
+			t.Fatal("a principal with no authority killed another's activation")
+		}
+		if ok, _ := HasAuthority(tx, alice, VerbWrite, "/secrets/app", 1015); !ok {
+			t.Fatal("the unauthorized kill took effect anyway")
+		}
+
+		// carol, who has admin at the scope, can.
+		bindPAM(t, tx, Binding{ID: "b-carol", Subject: carol, Role: "domain-admin", Scope: "/"})
+		if res := decide(tx, carol, alice, "act-1", op.ActivationKill, 1020); res.Err != nil {
+			t.Fatalf("an authorized kill was refused: %v", res.Err)
+		}
+	})
+}
+
+// Denying a pending request needs the same authority as approving one.
+func TestDenyRequiresAuthority(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		id := bindPAM(t, tx, Binding{ID: "b-pam", Subject: alice, Role: "kv-admin",
+			Scope: "/secrets", ActivationRequired: true, ApprovalRequired: true})
+		if res := requestAct(tx, alice, id, 1000, 3600, nil, 1000); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		if res := decide(tx, bob, alice, "act-1", op.ActivationDeny, 1010); res.Err == nil {
+			t.Fatal("a principal with no authority denied another's request")
+		}
+		a, _ := loadActivation(tx, alice, "act-1")
+		if a.State != ActivationPending {
+			t.Fatalf("the unauthorized denial took effect: %s", a.State)
+		}
+	})
+}
+
+// A principal may always give up their own elevated access. Making that hard
+// would only discourage people from doing it.
+func TestPrincipalMayAlwaysKillTheirOwnActivation(t *testing.T) {
+	withTx(t, func(tx *store.Tx) {
+		id := bindPAM(t, tx, Binding{ID: "b-pam", Subject: alice, Role: "kv-admin",
+			Scope: "/secrets", ActivationRequired: true})
+		if res := requestAct(tx, alice, id, 1000, 3600, nil, 1000); res.Err != nil {
+			t.Fatal(res.Err)
+		}
+		if res := decide(tx, alice, alice, "act-1", op.ActivationKill, 1010); res.Err != nil {
+			t.Fatalf("alice could not stand down her own activation: %v", res.Err)
+		}
+		if ok, _ := HasAuthority(tx, alice, VerbWrite, "/secrets/app", 1020); ok {
+			t.Fatal("access survived the principal's own kill")
+		}
+	})
+}
