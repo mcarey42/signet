@@ -34,6 +34,7 @@ import (
 	"github.com/mcarey42/signet/internal/fsm"
 	"github.com/mcarey42/signet/internal/kernel"
 	"github.com/mcarey42/signet/internal/keys"
+	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/seal"
 )
@@ -605,6 +606,7 @@ func cmdServe(args []string) error {
 	prefix := fs.String("tree-prefix", "/secrets", "where that mount lands in the resource tree")
 	nodeID := fs.String("node-id", "", "which issuing authority is this node's own, when the domain has several (see `signet ca issuers`); not the consensus identity")
 	domain := fs.String("domain", "", "this trust domain's name, e.g. home.example.net (named in audit checkpoints)")
+	metricsListen := fs.String("metrics-listen", "", "serve Prometheus metrics on this address, e.g. 127.0.0.1:9101 (off by default)")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
 	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
@@ -649,9 +651,28 @@ func cmdServe(args []string) error {
 
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           metrics.Middleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	// Metrics live on their own listener, off by default. An exposition
+	// endpoint on the main port would be reachable by everything that can reach
+	// the API; on its own address it can be bound to localhost or a management
+	// interface and scraped there.
+	if *metricsListen != "" {
+		mmux := http.NewServeMux()
+		mmux.Handle("GET /metrics", metrics.Handler(metrics.Default))
+		msrv := &http.Server{
+			Addr: *metricsListen, Handler: mmux, ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "signet: metrics listener stopped: %v\n", err)
+			}
+		}()
+		fmt.Fprintf(os.Stderr, "signet metrics on http://%s/metrics\n", *metricsListen)
+	}
+
 	fmt.Fprintf(os.Stderr, "signet serving on %s (mount %q -> %s)\n", *listen, *mount, *prefix)
 	if *tlsCert != "" {
 		return srv.ListenAndServeTLS(*tlsCert, *tlsKey)

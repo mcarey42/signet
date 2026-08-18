@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/seal"
 	"github.com/mcarey42/signet/internal/store"
@@ -163,8 +164,13 @@ func (n *Node) Propose(ctx context.Context, o op.Op) (op.Result, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		timeout = time.Until(dl)
 	}
+	// Measured around the whole commit-and-apply, because this is the part a
+	// faster handler cannot fix: it is consensus, not our code.
+	done := metrics.Time(metrics.ProposeDuration)
 	f := n.raft.Apply(sealed, timeout)
-	if err := f.Error(); err != nil {
+	err = f.Error()
+	done()
+	if err != nil {
 		return op.Result{}, fmt.Errorf("propose %s: %w", o.OpKind(), err)
 	}
 	res, ok := f.Response().(op.Result)

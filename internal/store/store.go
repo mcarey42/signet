@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mcarey42/signet/internal/metrics"
+
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -86,6 +88,9 @@ func (s *Store) DB() *bolt.DB      { return s.db }
 // entry being applied. The position feeds deterministic nonce derivation and
 // audit keys, which is why it is required rather than optional.
 func (s *Store) Update(term, index uint64, fn func(*Tx) error) error {
+	// Writes serialize on bbolt's single writer, so this histogram is where
+	// write contention shows up first.
+	defer metrics.Time(metrics.StoreWriteDuration)()
 	return s.db.Update(func(btx *bolt.Tx) error {
 		return fn(&Tx{tx: btx, b: s.b, term: term, index: index, write: true})
 	})
@@ -94,6 +99,9 @@ func (s *Store) Update(term, index uint64, fn func(*Tx) error) error {
 // View runs fn in a read transaction — a consistent snapshot, no writer
 // blocking.
 func (s *Store) View(fn func(*Tx) error) error {
+	// Reads run concurrently against a consistent snapshot; if this histogram
+	// and the authz one diverge, the cost is decryption rather than I/O.
+	defer metrics.Time(metrics.StoreReadDuration)()
 	return s.db.View(func(btx *bolt.Tx) error {
 		return fn(&Tx{tx: btx, b: s.b})
 	})

@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/mcarey42/signet/internal/kernel"
+	"github.com/mcarey42/signet/internal/metrics"
 	"github.com/mcarey42/signet/internal/op"
 	"github.com/mcarey42/signet/internal/store"
 )
@@ -44,6 +45,7 @@ func (f *FSM) Apply(l *raft.Log) any {
 	if l.Index <= f.applied.Load() {
 		return op.Result{}
 	}
+	defer metrics.Time(metrics.ApplyDuration)()
 	pt, err := f.st.Barrier().Open(l.Data, opAAD)
 	if err != nil {
 		return op.Result{Err: fmt.Errorf("fsm: decrypt entry %d: %w", l.Index, err)}
