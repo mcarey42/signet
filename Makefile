@@ -80,3 +80,10 @@ build-hsm: $(BUILD_DIR)
 test-trust: build
 	@cp $(BIN) ./signet-testbin
 	@BIN=$(PWD)/signet-testbin ./test/trust/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s
+
+# The multi-domain fabric: an org root over two subordinate domains plus one
+# sovereign domain, and the cross-domain impersonation attempts that must fail.
+.PHONY: test-fabric
+test-fabric: build
+	@cp $(BIN) ./signet-testbin
+	@BIN=$(PWD)/signet-testbin ./test/fabric/run.sh; s=$$?; rm -f ./signet-testbin; exit $$s

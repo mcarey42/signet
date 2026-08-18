@@ -29,6 +29,10 @@ type DomainState struct {
 	PinnedSPKI string `json:"pinned_spki"`
 	LastEpoch  uint64 `json:"last_epoch"`
 	UpdatedAt  int64  `json:"updated_at"`
+	// Bundle is the domain's last accepted bundle, kept verbatim so it can be
+	// re-verified rather than re-fetched. A consumer that federates with
+	// several domains holds one of these per domain and never merges them.
+	Bundle []byte `json:"bundle,omitempty"`
 }
 
 // LoadState reads consumer state, returning an empty one if the file is absent.

@@ -45,6 +45,8 @@ const trustUsage = `signet trust — trust bundles
   fetch    fetch a bundle from a domain, verify it, and install the anchor
   show     print what a bundle says (does not imply trusting it)
   verify   check a bundle against a pinned fingerprint
+  peers    list the trust domains this consumer federates with
+  check    verify a certificate against whichever domain may vouch for it
 `
 
 func cmdTrust(args []string) error {
@@ -63,6 +65,10 @@ func cmdTrust(args []string) error {
 		return trustShow(args[1:])
 	case "verify":
 		return trustVerify(args[1:])
+	case "peers":
+		return trustPeers(args[1:])
+	case "check":
+		return trustCheck(args[1:])
 	case "-h", "--help", "help":
 		fmt.Print(trustUsage)
 		return nil
@@ -361,10 +367,7 @@ func trustFetch(args []string) error {
 			"trust fetch: -url and -pin are both required. Fetching without a pin would mean " +
 				"trusting whatever answered, which is the problem bundles exist to solve")
 	}
-	if *statePath == "" {
-		home, _ := os.UserHomeDir()
-		*statePath = filepath.Join(home, ".signet", "trust.json")
-	}
+	*statePath = defaultStatePath(*statePath)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	if *insecure {
@@ -503,10 +506,12 @@ func verifyBundle(raw []byte, pin, domain, statePath string, record bool) (*trus
 		return nil, nil, err
 	}
 	if record && statePath != "" {
-		if err := st.Pin(p.Domain, pin); err != nil {
+		// Store the bundle, not merely the epoch: a consumer that federates
+		// with several domains keeps one bundle per domain and re-verifies it
+		// on use, so staleness and rollback are caught without a re-fetch.
+		if _, err := st.Peer(pin, raw, time.Now()); err != nil {
 			return nil, nil, err
 		}
-		st.Accept(p.Domain, p.Epoch, time.Now().Unix())
 	}
 	return p, st, nil
 }
@@ -596,4 +601,134 @@ func parseCertPEM(blob []byte) (*x509.Certificate, error) {
 
 func pemEncodeCert(c *x509.Certificate) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})
+}
+
+func trustPeers(args []string) error {
+	fs := flag.NewFlagSet("trust peers", flag.ExitOnError)
+	statePath := fs.String("state", "", "consumer state file (default ~/.signet/trust.json)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	st, err := trust.LoadState(defaultStatePath(*statePath))
+	if err != nil {
+		return err
+	}
+	names := st.DomainNames()
+	if len(names) == 0 {
+		return fmt.Errorf(
+			"this consumer federates with no domains yet. `signet trust fetch -url ... -pin ...` "+
+				"establishes the first link; the pin must come from somewhere other than the "+
+				"domain you are pinning (state: %s)", defaultStatePath(*statePath))
+	}
+	fmt.Printf("%-24s %-12s %-6s %-8s %s\n", "DOMAIN", "STANDING", "EPOCH", "STATUS", "SHARES ROOT WITH")
+	shared := false
+	for _, d := range names {
+		ds := st.Get(d)
+		status := "ok"
+		if p, err := trust.PayloadOfBytes(ds.Bundle); err == nil {
+			expires := time.Unix(p.IssuedAt, 0).Add(time.Duration(p.MaxAgeSec) * time.Second)
+			if time.Now().After(expires) {
+				status = "STALE"
+			}
+		} else if len(ds.Bundle) == 0 {
+			status = "no bundle"
+		}
+		with := strings.Join(st.SharesRootWith(d), ", ")
+		if with == "" {
+			with = "-"
+		} else {
+			shared = true
+		}
+		fmt.Printf("%-24s %-12s %-6d %-8s %s\n", d, st.Sovereignty(d), ds.LastEpoch, status, with)
+	}
+	fmt.Println("\nBundles are held separately and never merged: an identity is verified only")
+	fmt.Println("against the domain that may vouch for it.")
+	if shared {
+		fmt.Println("\nDomains sharing a root are not sovereign against each other: whoever holds")
+		fmt.Println("that root could mint into either namespace. Signet still keeps them apart —")
+		fmt.Println("each domain publishes its own issuers and a chain through anyone else's is")
+		fmt.Println("refused — but that is a policy boundary, not a cryptographic one.")
+	}
+	return nil
+}
+
+// trustCheck answers the question a relying party actually has: is this
+// certificate something I should believe, and who says so.
+func trustCheck(args []string) error {
+	fs := flag.NewFlagSet("trust check", flag.ExitOnError)
+	certPath := fs.String("cert", "", "certificate to check")
+	domain := fs.String("domain", "", "trust domain, when the certificate carries no spiffe:// URI")
+	chainPath := fs.String("chain", "", "intermediates the presenter supplied, as a TLS peer would")
+	statePath := fs.String("state", "", "consumer state file (default ~/.signet/trust.json)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *certPath == "" {
+		return errors.New("trust check: -cert is required")
+	}
+	blob, err := os.ReadFile(*certPath)
+	if err != nil {
+		return err
+	}
+	cert, err := parseCertPEM(blob)
+	if err != nil {
+		return fmt.Errorf("trust check: %s: %w", *certPath, err)
+	}
+	st, err := trust.LoadState(defaultStatePath(*statePath))
+	if err != nil {
+		return err
+	}
+	var extra []*x509.Certificate
+	if *chainPath != "" {
+		blob, err := os.ReadFile(*chainPath)
+		if err != nil {
+			return err
+		}
+		for rest := blob; len(rest) > 0; {
+			var blk *pem.Block
+			if blk, rest = pem.Decode(rest); blk == nil {
+				break
+			}
+			if c, err := x509.ParseCertificate(blk.Bytes); err == nil {
+				extra = append(extra, c)
+			}
+		}
+	}
+	id, err := st.VerifyLeafWith(cert, extra, *domain, time.Now())
+	if err != nil {
+		return fmt.Errorf("trust check: %w", err)
+	}
+	fmt.Printf("accepted\n  identity: %s\n  domain:   %s\n  anchor:   %s %q\n",
+		orDash(id.URI, id.CN), id.Domain, id.AnchorRole, id.Anchor)
+	if id.AnchorRole == trust.RoleRoot {
+		fmt.Println("\nVerified via the domain's root anchor, and through an issuer this domain")
+		fmt.Println("publishes. Under a shared root the chain alone would not have been enough:")
+		fmt.Println("a sibling domain's issuer reaches the same anchor.")
+	}
+	return nil
+}
+
+func defaultStatePath(p string) string {
+	if p != "" {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".signet", "trust.json")
+}
+
+func short(spki string) string {
+	if len(spki) > 26 {
+		return spki[:26] + "..."
+	}
+	return spki
+}
+
+func orDash(a, b string) string {
+	if a != "" {
+		return a
+	}
+	if b != "" {
+		return b
+	}
+	return "-"
 }

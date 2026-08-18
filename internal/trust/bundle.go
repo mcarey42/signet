@@ -332,6 +332,14 @@ func (p *Payload) SelectAnchor(role AnchorRole, name string) (*Anchor, error) {
 
 // Pool builds a verification pool for a chosen anchor, plus the issuers needed
 // to build paths up to it.
+//
+// WARNING: under a shared root these pools are not sufficient on their own. A
+// sibling domain's issuer also chains to the same anchor, so a presenter that
+// supplies its own intermediates — as every TLS peer does — can build a valid
+// path with an issuer this bundle never published. Use VerifyCert, which
+// re-checks the resulting chain against the published issuer set. Pool is for
+// exporting material to tools that verify elsewhere (openssl, a TLS config
+// whose peer chain you separately constrain).
 func (p *Payload) Pool(anchor *Anchor) (roots *x509.CertPool, intermediates *x509.CertPool, err error) {
 	roots = x509.NewCertPool()
 	cert, err := parseCert(anchor.CertPEM)

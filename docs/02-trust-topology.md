@@ -161,6 +161,42 @@ this. Therefore:
   cost of offline/partition-tolerant parent re-issue. A deliberate trade for a
   genuinely adversarial parent.
 
+### Sibling power over a sibling (measured 2026-08-17, milestone 4c)
+
+E-01 DB-1 covers what a *parent* can do to a child. Building the fabric
+surfaced the neighbouring case, which had not been stated: under cascade, one
+child can impersonate **another child**, and it needs nothing from the parent
+to do it.
+
+Every domain's issuer descends from the same organizational root. That root is
+the anchor in every subordinate domain's bundle. So a certificate signed by
+home's issuer, bearing a `spiffe://gcp.example.net/...` identity, builds a
+**genuinely valid chain** to gcp's own anchor — provided the verifier sees
+home's issuer. And it does: every TLS peer presents its own chain. Measured, not
+theorised; the failing case is in `internal/trust` and `test/fabric/run.sh`.
+
+Two things follow.
+
+**Path validity is not proof that a domain vouched for something.** A verifier
+must also require that the chain runs only through issuers *that domain
+published in its own bundle*. This is what makes the bundle's issuer list
+load-bearing rather than a convenience for path building, and it is implemented
+in `Payload.VerifyCert`. Handing out `Pool()` and letting a caller verify with
+it is not sufficient under a shared root, and that function now says so.
+
+**Under cascade, domain separation is a policy boundary, not a cryptographic
+one.** It holds because verifiers enforce the published-issuer rule. Under
+sovereignty it is arithmetic: there is no path from aws's root to anything the
+org signed, so the forgery fails even when handed the entire organizational
+chain. That is the concrete, demonstrable difference between the two modes, and
+it is the honest answer to "what does sovereignty actually buy me".
+
+`signet trust peers` therefore reports **shared root** rather than claiming a
+domain is sovereign, and names the domains it shares with. Sovereignty cannot
+be read from a single bundle — a domain's own root and its parent's are
+indistinguishable in isolation — but a consumer *can* see that two domains it
+federates with present the same root, and that is the fact that matters.
+
 ## Anchors, issuers, and the two trust flows (Decided 2026-08-16)
 
 Three separable decisions get conflated whenever someone says "the root CA".

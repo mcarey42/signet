@@ -125,6 +125,7 @@ type GenesisConfig struct {
 		AllowSubdomains  bool     `json:"allow_subdomains"`
 		AllowBareDomains bool     `json:"allow_bare_domains"`
 		AllowIPSANs      bool     `json:"allow_ip_sans"`
+		AllowedURIPrefix []string `json:"allowed_uri_prefixes"`
 		MaxTTLSeconds    int64    `json:"max_ttl_seconds"`
 	} `json:"pki_roles"`
 	SSHRoles []struct {
@@ -482,6 +483,18 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 		return err
 	}
 	var cfg GenesisConfig
+	// Unknown keys are an error, not a shrug. A declarative config that
+	// silently ignores a field the operator wrote is the worst kind of
+	// failure: the system reports success and does something else. This was
+	// found the hard way — `allowed_uri_prefixes` was accepted and dropped,
+	// and the resulting refusal named the role rather than the config.
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return fmt.Errorf(
+			"reading %s: %w — every key in a genesis config must be one Signet understands, "+
+				"because a key that is quietly ignored looks exactly like one that worked", path, err)
+	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -528,7 +541,8 @@ func loadConfig(ctx context.Context, k *kernel.Kernel, actor op.ID, path string)
 		if err := k.PutPKIRole(ctx, actor, ca.Role{
 			Name: r.Name, Scope: r.Scope, AllowedDomains: r.AllowedDomains,
 			AllowSubdomains: r.AllowSubdomains, AllowBareDomains: r.AllowBareDomains,
-			AllowIPSANs: r.AllowIPSANs, MaxTTLSeconds: r.MaxTTLSeconds,
+			AllowIPSANs: r.AllowIPSANs, AllowedURIPrefix: r.AllowedURIPrefix,
+			MaxTTLSeconds: r.MaxTTLSeconds,
 		}); err != nil {
 			return fmt.Errorf("config: pki role %s: %w", r.Name, err)
 		}

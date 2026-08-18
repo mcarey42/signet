@@ -25,6 +25,7 @@ project has hit was found by running a real client, never by a test I wrote.
 | **Seal rotation** — file seal → HSM, or HSM key → successor | A live domain rotated with every credential still valid |
 | **Split CA ceremonies** — one offline root certifying many per-node issuers | Two nodes of different custody (file seal, PKCS#11) under one root; each leaf chains to it |
 | **Trust bundles** — root-signed anchors + issuer set + revocation + epochs | `openssl` verifying leaves against anchors a consumer fetched over HTTP and chose between |
+| **Multi-domain fabric** — several domains federated, bundles held separately and never merged | A 4-domain fabric (org root over home + gcp, sovereign aws) refusing cross-domain impersonation from both a shared root and a separate one |
 
 ## What is deliberately absent
 
@@ -33,11 +34,15 @@ Not oversights — each is scheduled with the milestone that needs it (docs/15):
 - **Multi-node domains.** One voter, no join, no promotion, no network
   transport. Growing a domain is milestone 4; keeping the code absent is
   deliberate, because what is not there cannot be half-right.
-- **Federation and sovereign mode.** Trust bundles now exist (one domain,
-  root-signed, with anchor selection and rollback protection). Still unbuilt:
-  cross-certification between domains, the sovereign-child cryptography in
-  docs/02, and bundle exchange *between* domains — today a bundle describes one
-  domain and is never merged with another's.
+- **Cross-certification and the sovereign-child cryptography.** A consumer can
+  federate with several domains and verify each against its own bundle
+  (milestone 4c). Still unbuilt: parent↔child-root cross-certificates, the
+  self-certifying-namespace and key-transparency options in docs/02, and
+  *server-side* federation — a node does not yet hold or serve links to peer
+  domains, so the fabric lives in the consumer's state file.
+- **Converting a live domain from subordinate to sovereign.** The two modes
+  both work; there is no ceremony that moves an existing domain between them
+  without re-issuing its leaves.
 - **Online revocation.** Revocation rides the root-signed bundle, so
   withdrawing an issuer is an offline ceremony. Short-lived leaf revocation
   would need a delegated online signing key, which does not exist.
@@ -112,7 +117,20 @@ Kept as a record of where the value came from:
    three seconds later with the real binary caught it immediately. Skew now
    applies only where clocks genuinely disagree, and the test uses the skew
    callers actually pass.
-10. **Publishing a bundle needed the node stopped.** The first implementation
+10. **A sibling domain could impersonate another under a shared root.** Every
+    subordinate domain's issuer descends from the organizational root, which is
+    the anchor in every sibling's bundle — so a certificate from home's issuer
+    bearing a gcp identity built a genuinely valid chain to gcp's anchor as
+    soon as the presenter supplied its own intermediate, which is what every
+    TLS peer does. Fixed by requiring the chain to run only through issuers the
+    domain published. The lesson generalizes: *building a path to an anchor is
+    not proof that the anchor's owner vouched for the certificate.*
+11. **A genesis config key was silently ignored.** `allowed_uri_prefixes` was
+    accepted, dropped, and the resulting refusal named the PKI role rather than
+    the config — so the config looked applied and was not. Unknown keys are now
+    a hard error, because a quietly ignored key is indistinguishable from one
+    that worked.
+12. **Publishing a bundle needed the node stopped.** The first implementation
    wrote through the local store, which the running server holds — meaning a
    monthly bundle refresh would have been a monthly outage. Publishing is now
    an authorized API write, verified kernel-side against the root the node
