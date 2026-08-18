@@ -1,0 +1,79 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            debarch: amd64
+          - goarch: arm64
+            debarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: version from tag
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Static by default: the hardware-seal build needs cgo and is shipped
+      # separately, because a binary that silently lacked PKCS#11 support would
+      # be worse than one that refuses a configured hardware seal outright.
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ steps.v.outputs.version }}" \
+            -o signet ./cmd/signet
+
+      - name: build the .deb
+        run: ./packaging/build-deb.sh "${{ steps.v.outputs.version }}" "${{ matrix.debarch }}" ./signet
+
+      - name: checksums
+        run: sha256sum *.deb signet > "SHA256SUMS-${{ matrix.debarch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signet-${{ matrix.debarch }}
+          path: |
+            *.deb
+            SHA256SUMS-*.txt
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # Pre-1.0 with known open findings: nothing here is a stable
+          # interface, and the release page should say so rather than implying
+          # otherwise by omission.
+          prerelease: true
+          body: |
+            **Pre-1.0. Not recommended for production.**
+
+            See [`docs/pentest/REGISTER.md`](docs/pentest/REGISTER.md) for the
+            open findings register, and [`SECURITY.md`](SECURITY.md) before
+            sending anyone a trace or a log.

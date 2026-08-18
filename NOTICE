@@ -1,0 +1,11 @@
+Signet
+Copyright 2026 Mark Carey
+
+This product includes software developed as an open-source project.
+
+Portions of this software depend on:
+  - github.com/hashicorp/raft (MPL-2.0)
+  - github.com/hashicorp/raft-boltdb (MPL-2.0)
+  - go.etcd.io/bbolt (MIT)
+  - golang.org/x/crypto (BSD-3-Clause)
+  - github.com/miekg/pkcs11 (BSD-3-Clause, built only with the `pkcs11` tag)

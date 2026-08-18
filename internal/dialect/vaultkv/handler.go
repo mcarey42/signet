@@ -59,7 +59,10 @@ type Config struct {
 	// Domain names this trust domain in the artifacts it signs — audit
 	// checkpoints, so a witness can tell whose history it is holding.
 	Domain string
-	Status func() Status
+	// Version is reported by sys/health. Vault clients parse this field, so it
+	// carries a version string rather than being omitted.
+	Version string
+	Status  func() Status
 }
 
 type Handler struct {
@@ -76,6 +79,9 @@ func New(k *kernel.Kernel, cfg Config) *Handler {
 	}
 	if cfg.NodeID == "" {
 		cfg.NodeID = "signet-0"
+	}
+	if cfg.Version == "" {
+		cfg.Version = "dev"
 	}
 	return &Handler{k: k, cfg: cfg}
 }
@@ -444,7 +450,7 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 		"initialized": st.Initialized,
 		"sealed":      st.Sealed,
 		"standby":     !st.Leader,
-		"version":     "signet-0.1.0-mvp",
+		"version":     "signet-" + h.cfg.Version,
 	}
 	code := http.StatusOK
 	if st.Halted != "" {

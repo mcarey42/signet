@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: vet
+        run: go vet ./...
+
+      - name: unit and integration tests
+        run: go test ./... -count=1
+
+      # Most tests are single-goroutine, so a clean race run means the
+      # concurrent paths that ARE exercised are clean — not that the system is
+      # race-free. Worth running, worth not over-claiming.
+      - name: race detector
+        run: go test ./... -race -count=1
+
+      - name: build
+        run: go build -o signet ./cmd/signet
+
+      # The end-to-end suites stand up real nodes and verify with EXTERNAL
+      # tools. Checking our own certificates with our own verifier would prove
+      # considerably less, which is the whole reason these exist.
+      - name: end-to-end (trust, fabric, pam, audit)
+        run: |
+          set -euo pipefail
+          for suite in trust fabric pam audit; do
+            echo "::group::$suite"
+            BIN="$PWD/signet" bash "./test/$suite/run.sh"
+            echo "::endgroup::"
+          done
+
+  hardware-seal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: install SoftHSM2
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc
+
+      # SoftHSM is a simulator, not a hardware module. It exercises the same
+      # code path, which is why it is worth running — but docs/18 records what
+      # only real hardware can settle.
+      - name: PKCS#11 seal tests
+        run: |
+          set -euo pipefail
+          export SOFTHSM2_CONF="$PWD/softhsm2.conf"
+          mkdir -p "$PWD/tokens"
+          printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$PWD" > "$SOFTHSM2_CONF"
+          softhsm2-util --init-token --free --label signet --pin 1234 --so-pin 5678
+          MODULE=$(ls /usr/lib/softhsm/libsofthsm2.so /usr/lib/*/softhsm/libsofthsm2.so 2>/dev/null | head -1)
+          pkcs11-tool --module "$MODULE" --login --pin 1234 --keygen --key-type aes:32 \
+            --label signet-seal --usage-decrypt
+          CGO_ENABLED=1 SIGNET_TEST_PKCS11="pkcs11:?module=$MODULE&token=signet&pin=1234&label=signet-seal" \
+            go test -tags pkcs11 ./internal/seal/ -count=1

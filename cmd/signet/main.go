@@ -40,6 +40,10 @@ import (
 	"github.com/mcarey42/signet/internal/trace"
 )
 
+// version is set at build time with -ldflags "-X main.version=...". The default
+// says "built from a working tree", which is more useful than a fake number.
+var version = "dev"
+
 const usage = `signet — unified identity, PKI, RBAC, and secrets (MVP)
 
   signet genesis  -data-dir DIR [-config FILE]   initialize a domain, print a root token
@@ -83,6 +87,9 @@ func main() {
 		err = cmdPAM(os.Args[2:])
 	case "ca":
 		err = cmdCA(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Printf("signet %s\n", version)
+		return
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -656,6 +663,7 @@ func cmdServe(args []string) error {
 		CAName:     "default",
 		NodeID:     *nodeID,
 		Domain:     *domain,
+		Version:    version,
 		Status: func() vaultkv.Status {
 			s := node.Status()
 			return vaultkv.Status{

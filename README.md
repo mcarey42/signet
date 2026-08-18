@@ -1,110 +1,122 @@
 # Signet
 
-A compact, distributed authority for **identity, authentication, PKI, RBAC, and
-secrets** — one Go binary, designed for sovereign hybrid infrastructure: cloud
-nodes, on-prem servers, low-power hardware, and Kubernetes.
+Identity, PKI, authorization, and secrets in one binary.
 
-## The core idea
+> **Pre-1.0. Not recommended for production.** It works, it is tested hard, and
+> there are 19 known open findings listed in
+> [`docs/pentest/REGISTER.md`](docs/pentest/REGISTER.md). Read that before you
+> deploy anything you care about.
 
-Kerberos, Active Directory, Vault, and Keycloak are the same abstract machine
-wearing four protocol costumes:
+Signet is one kernel — authenticate a principal, evaluate policy, mint a
+short-lived scoped credential — with protocol dialects layered over it as thin
+serializers. A Vault-compatible KV API, an internal CA, an OIDC issuer, and an
+SSH certificate authority are all the same decision expressed four ways.
 
-> **Authenticate a principal → evaluate policy against an identity graph →
-> mint a short-lived, scoped, cryptographically verifiable credential.**
+It exists because running OpenBao *and* an identity provider *and* a CA means
+running three sources of truth that disagree at the edges. The disagreements
+are where the incidents live.
 
-Signet builds that machine **once** — the *kernel* (identity graph + policy
-engine + key hierarchy + replicated log) — and exposes it through thin
-*credential dialects*: OIDC tokens, X.509 certs (ACME), SSH certs, and a
-Vault-compatible KV secrets API. A ticket, a cert, a token, and a lease are all
-the same object: a signed claim of *who, what scope, until when*.
+## What works today
 
-## Design pillars
+Every row here means *verified against real client software*, not against a
+test double. That distinction has earned its keep: nearly every consequential
+bug in this project was found by running a real client.
 
-- **Sovereign by construction.** Each trust domain runs its own small Raft
-  group and stays fully operational while partitioned. There is no global
-  database; federation between domains is the exchange of signed artifacts.
-- **The hierarchy IS the PKI chain.** Parent domains delegate to children by
-  issuing name-constrained intermediate CAs. Delegation, scoping, and subtree
-  revocation are PKI operations every verifier enforces independently.
-- **Short-lived everything.** Sessions are hours; role credentials are minutes;
-  every renewal is a fresh policy evaluation. Revocation is mostly "stop
-  renewing."
-- **Authority without availability coupling.** Rights ride *inside* signed
-  credentials (offline verification by default); online introspection and
-  step-up auth exist as opt-in tiers for high-value roles.
-- **Tiny and boring to operate.** One static binary (server + agent modes),
-  runs on a Celeron, a t4g.small, or a k3s pod. Dependency budget: a Raft
-  library, an embedded KV store, and Go's standard library crypto.
+| Capability | Proven by |
+|---|---|
+| **Secrets** — Vault KV v2: versions, metadata, CAS, soft delete/undelete/destroy | External Secrets Operator v2.9.0 and the `bao` CLI, unmodified |
+| **Workload identity** — Kubernetes ServiceAccount attestation | ESO authenticating as itself, no shared secret anywhere |
+| **Certificates** — internal CA, `pki/sign`, published chain | cert-manager v1.19; `openssl` verifying the results |
+| **SSO** — OIDC discovery, JWKS, RFC 8693 token exchange | `kubectl` against a real Kubernetes API server |
+| **SSH** — OpenSSH certificate authority | A real `sshd` accepting a Signet certificate |
+| **Scoped RBAC** — component-wise scopes, delegation-only-narrows | Property tests over randomized tree shapes |
+| **Privileged access** — eligible-vs-held, approval, step-up, kill | A live node refusing an authority until someone else approves |
+| **Hardware custody** — PKCS#11 seal, keys generated in-token | SoftHSM2; the token refuses to export them |
+| **Anchored audit** — hash chain, signed checkpoints, peer witnessing | A rollback attack the local chain calls valid and the witness refuses |
+| **Trust bundles & federation** — anchors, epochs, cross-domain scoping | `openssl` verifying leaves against anchors fetched over HTTP |
 
-## Status
+## Quick start
 
-**Working, single-node.** Real clients use it unmodified today:
-
-- **[External Secrets Operator](https://external-secrets.io)** reads secrets,
-  authenticating as its own Kubernetes workload — no shared secret, no agent.
-- **[cert-manager](https://cert-manager.io)** obtains certificates from its CA.
-- **`kubectl`** authenticates to a real Kubernetes API server via OIDC, with
-  RBAC driven by Signet roles.
-- **`ssh`** logs into a real `sshd` with a Signet certificate and no
-  `authorized_keys` file.
-- **`bao`** (the OpenBao CLI) drives the KV surface.
-
-Keys can be *held inside a PKCS#11 HSM* — generated there, non-extractable,
-never present in Signet's memory — with a rotation ceremony to move custody
-between seals. See **[docs/16](docs/16-implementation-status.md)** for exactly
-what works versus what is still design.
-
-Run it yourself with `./test/kind/run.sh`.
-
-Still absent by design, each scheduled with the milestone that needs it:
-multi-node domains, federation and sovereign mode, the workstation agent,
-JIT/PAM activation, the GitOps reconciler, and backups. See
-[docs/](docs/README.md) for the design record behind every decision.
-
-```bash
-make test && make build      # static, pure-Go
-make test-hsm                # seal tests against a SoftHSM token
-
-# initialize a domain — prints a root token, writes a seal key
-signet genesis -data-dir ./data -config genesis.json
-
-# or put the CA keys inside an HSM, where they are generated and never leave
-signet genesis -data-dir ./data -ca-in-hardware \
-  -seal 'pkcs11:?module=/usr/lib/softhsm/libsofthsm2.so&token=signet&pin=…&label=signet-seal'
-
-# move key custody between seals; credentials issued before stay valid
-signet seal status -data-dir ./data
-signet seal rotate -data-dir ./data -to 'pkcs11:?module=…&token=…&pin=…&label=…'
-
-# serve the Vault-compatible API
-signet serve -data-dir ./data -listen 127.0.0.1:8200 -mount secrets
-
-# write and read a secret
-signet kv put -token "$TOKEN" -mount secrets apps/litellm master-key=sk-abc
-curl -H "X-Vault-Token: $TOKEN" localhost:8200/v1/secrets/data/apps/litellm
+```sh
+make build
+./signet genesis -data-dir ./data          # prints a root token
+./signet serve   -data-dir ./data -listen 127.0.0.1:8200
 ```
 
-`genesis.json` declares desired state — principals and the roles they hold at a
-scope. Runtime state (sessions, tokens) is never declared:
-
-```json
-{
-  "principals": [{"path": "/clusters/svc/apps/eso", "type": "workload"}],
-  "bindings": [{"subject": "/clusters/svc/apps/eso",
-                "role": "kv-reader", "scope": "/secrets/cluster-svc"}]
-}
+```sh
+export SIGNET_ADDR=http://127.0.0.1:8200 SIGNET_TOKEN=signet....
+./signet kv put secrets/app password=hunter2
+./signet kv get secrets/app
 ```
 
-### Building
+Vault clients work unmodified against the same endpoint:
 
-The toolchain needs `flock`, which this repo's NFS mount does not provide, so
-the `Makefile` builds and tests from a local-disk mirror. On a normal
-filesystem, plain `go build ./...` works too.
+```sh
+VAULT_ADDR=$SIGNET_ADDR VAULT_TOKEN=$SIGNET_TOKEN bao kv get -mount=secrets app
+```
 
-First real deployment target: a homelab currently running OpenBao + fleet PKI,
-replacing the secrets/PKI layer and adding identity/SSO — then generalizing.
+## Design
 
-## License
+The documents in `docs/` are the design record, written before and alongside the
+code, and corrected when reality disagreed:
 
-To be decided publicly before first code: Apache-2.0 or MPL-2.0
-(see [docs/12-governance.md](docs/12-governance.md)).
+- [`00-charter.md`](docs/00-charter.md) — scope, non-goals, and the six decision principles
+- [`01-threat-model.md`](docs/01-threat-model.md) — the STRIDE pass and what came out of it
+- [`02-trust-topology.md`](docs/02-trust-topology.md) — hierarchy, anchors, and what sovereignty actually buys
+- [`03-consistency-storage.md`](docs/03-consistency-storage.md) — Raft, bbolt, and the barrier
+- [`13-kernel-data-model.md`](docs/13-kernel-data-model.md) — principals, bindings, scopes, JIT/PAM
+- [`16-implementation-status.md`](docs/16-implementation-status.md) — what is built vs. designed, and the bugs that running real software found
+- [`17-performance.md`](docs/17-performance.md) — measured numbers, and what is not yet measured
+
+## Dependencies
+
+Three, deliberately: `hashicorp/raft`, `raft-boltdb`, and `bbolt`, plus
+`golang.org/x/crypto` for SSH and `miekg/pkcs11` behind a build tag. Everything
+cryptographic is Go's standard library. Metrics, JOSE, JWKS, X.509 profiles and
+the audit chain are all hand-rolled, because the alternative was a dependency
+tree an authority server should not have.
+
+## Testing
+
+```sh
+make test         # unit and integration
+make test-race    # the same under the race detector
+make test-trust   # trust bundles, verified with openssl
+make test-fabric  # a four-domain federation, including impersonation attempts
+make test-pam     # privileged access against a live node
+make test-audit   # audit rewrite attacks against two real domains
+make test-hsm     # PKCS#11 against SoftHSM2
+```
+
+The end-to-end suites verify with **external** tools wherever possible —
+`openssl`, `sshd`, `kubectl`, `bao` — because checking our own certificates
+with our own verifier proves considerably less.
+
+## Diagnostics
+
+Tracing is off unless switched on and costs nothing while off:
+
+```sh
+./signet serve -data-dir ./data -trace-file /tmp/signet.trace -trace-areas authz
+./signet trace help    # what a trace contains, before you share one
+```
+
+**A trace records paths and identifiers, never secret values or tokens.** Paths
+often carry customer or project names — read
+[SECURITY.md](SECURITY.md#️-before-you-send-us-a-trace-or-a-log) before sending
+one to anybody, including us.
+
+Prometheus metrics are also off by default (`-metrics-listen`), and label by
+route *pattern* rather than concrete path so they are safe to scrape.
+
+## Status and honesty
+
+This project publishes its own vulnerability register, including the four
+criticals that were the author's own work and the two occasions where a fix
+introduced the next bug. A security tool that has not been attacked is one
+whose bugs are merely unknown; the register is more useful to someone
+evaluating this code than a clean-looking repository would be.
+
+## Licence
+
+[Apache-2.0](LICENSE).

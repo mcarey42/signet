@@ -8,5 +8,15 @@
 
 # build artifacts
 /signet
+/signet-hsm
+/signet-testbin
+/signet-fab
+/signet-aud
 /data/
 *.token
+*.deb
+SHA256SUMS*.txt
+
+# diagnostic traces — these record paths and identifiers; see SECURITY.md
+*.jsonl
+*.trace

@@ -1,0 +1,46 @@
+[Unit]
+Description=Signet — identity, PKI, authorization and secrets
+Documentation=https://github.com/mcarey42/signet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signet
+Group=signet
+EnvironmentFile=/etc/signet/signet.env
+ExecStart=/usr/bin/signet serve -data-dir /var/lib/signet $SIGNET_ARGS
+Restart=on-failure
+RestartSec=5s
+
+# A secrets authority should be able to do very little besides its job.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The data directory is the only writable path. Signet keeps the store, the
+# seal key and the Raft log here, so it is 0700 and owned by the service user.
+ReadWritePaths=/var/lib/signet
+
+# Core dumps of a process holding unsealed key material are not something to
+# leave lying around.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
