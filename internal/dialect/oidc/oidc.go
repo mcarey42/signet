@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,14 @@ const (
 )
 
 type Config struct {
+	// Audiences bounds who this issuer will mint tokens for. Empty means the
+	// exchange endpoint is closed, which is the safe default: an issuer that
+	// will address anyone is a lateral-movement primitive.
+	Audiences []string
+	// MaxTTL caps every credential this dialect issues. Zero uses
+	// DefaultMaxTokenTTL.
+	MaxTTL time.Duration
+
 	// Issuer is the externally reachable URL clients will see in the `iss`
 	// claim and use to fetch discovery. It must match exactly what relying
 	// parties are configured with — a Kubernetes API server compares strings.
@@ -118,6 +127,18 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request", "missing audience")
 		return
 	}
+	// The audience must be one this issuer is willing to speak to.
+	//
+	// Any authenticated session could previously mint a Signet-signed token for
+	// ANY audience it named — its own identity and roles, but addressed to the
+	// Kubernetes API server, or to any other relying party that trusts this
+	// issuer. That is not impersonation, but it is a confinement break, and it
+	// becomes lateral movement the moment a second consumer trusts us.
+	if !h.cfg.audienceAllowed(audience) {
+		writeErr(w, http.StatusBadRequest, "invalid_target",
+			"this issuer does not mint tokens for that audience; it is not in the configured set")
+		return
+	}
 
 	s, err := h.k.LookupSession(r.Context(), subject)
 	if err != nil {
@@ -127,9 +148,24 @@ func (h *Handler) token(w http.ResponseWriter, r *http.Request) {
 
 	ttl := h.cfg.DefaultTTL
 	if v := r.Form.Get("requested_token_lifetime"); v != "" {
-		if d, err := time.ParseDuration(v + "s"); err == nil && d > 0 {
-			ttl = d
+		// RFC 8693 says this is a number of SECONDS. Parsing it as a Go
+		// duration string meant "5m" became ParseDuration("5ms") — five
+		// MILLISECONDS, not five minutes — and "1h" errored into a silent
+		// fallback. Parse the integer the spec describes, and refuse anything
+		// else rather than quietly substituting a different lifetime.
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			writeErr(w, http.StatusBadRequest, "invalid_request",
+				"requested_token_lifetime is a whole number of seconds (RFC 8693 §2.1)")
+			return
 		}
+		ttl = time.Duration(n) * time.Second
+	}
+	// A ceiling regardless of what was asked for. Without one a non-expiring
+	// session could mint a decade-long offline credential that no relying party
+	// would ever re-check with us.
+	if max := h.cfg.maxTTL(); ttl > max {
+		ttl = max
 	}
 	cred, claims, err := h.k.Issue(r.Context(), s, kernel.IssueRequest{
 		Audience: audience,
@@ -229,4 +265,30 @@ func (jwtSerializer) Verify(cred []byte, c kernel.Claims, k *keys.Key, sl seal.S
 		}
 	}
 	return nil
+}
+
+// DefaultMaxTokenTTL bounds an offline credential when nothing else does.
+//
+// A non-expiring session could otherwise mint a decade-long token: Issue clamps
+// to the session's own expiry, and a session with no expiry has nothing to
+// clamp to. A relying party never re-checks an offline credential with us, so
+// its lifetime is the real revocation window.
+const DefaultMaxTokenTTL = 12 * time.Hour
+
+func (c Config) maxTTL() time.Duration {
+	if c.MaxTTL > 0 {
+		return c.MaxTTL
+	}
+	return DefaultMaxTokenTTL
+}
+
+// audienceAllowed reports whether this issuer will speak to that relying party.
+// An empty set closes the exchange endpoint, which is the safe default.
+func (c Config) audienceAllowed(aud string) bool {
+	for _, a := range c.Audiences {
+		if a == aud {
+			return true
+		}
+	}
+	return false
 }

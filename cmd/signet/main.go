@@ -608,6 +608,8 @@ func cmdServe(args []string) error {
 	domain := fs.String("domain", "", "this trust domain's name, e.g. home.example.net (named in audit checkpoints)")
 	metricsListen := fs.String("metrics-listen", "", "serve Prometheus metrics on this address, e.g. 127.0.0.1:9101 (off by default)")
 	maxBody := fs.Int64("max-body-bytes", 8<<20, "largest request body accepted on any route")
+	oidcAudiences := fs.String("oidc-audiences", "", "comma-separated audiences the token-exchange endpoint may mint for (empty closes it)")
+	oidcMaxTTL := fs.Duration("oidc-max-ttl", 12*time.Hour, "ceiling on any offline credential this node issues")
 	pkiMount := fs.String("pki-mount", "pki", "mount name for certificate signing")
 	sshMount := fs.String("ssh-mount", "ssh", "mount name for SSH certificate signing")
 	issuerURL := fs.String("issuer-url", "", "externally reachable OIDC issuer URL (must match what relying parties are configured with)")
@@ -647,7 +649,9 @@ func cmdServe(args []string) error {
 		oidcIssuer = scheme + "://" + *listen
 	}
 	mux := h.Routes()
-	oidc.New(k, oidc.Config{Issuer: oidcIssuer}).Register(mux)
+	oidc.New(k, oidc.Config{
+		Issuer: oidcIssuer, Audiences: splitList(*oidcAudiences), MaxTTL: *oidcMaxTTL,
+	}).Register(mux)
 	sshca.New(k, sshca.Config{Mount: *sshMount}).Register(mux)
 
 	srv := &http.Server{
